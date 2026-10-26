@@ -4,4 +4,4 @@ aiohttp-socks==0.8.4
 waitress==3.0.2
 aiodns==3.2.0
 brotli==1.1.0
-uvloop==0.20.0
+uvloop==0.23.0
