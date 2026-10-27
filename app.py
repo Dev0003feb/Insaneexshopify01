@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# ==============================================================================
-#  SHOPIFY CHECKER API  —  SINGLE-PROCESS UNLIMITED EDITION  v6
-# ------------------------------------------------------------------------------
-#  PORT 5000 | aiohttp.web | NO proxies.txt | auto proxy rotation | no limits
-#
-#  ENDPOINTS
-#    GET  /shopify?site=DOMAIN&card=CARD|MM|YYYY|CVV&proxy=host:port
-#    GET  /shopify?site=DOMAIN&cc=CARD|MM|YYYY|CVV&proxy=...      (cc alias)
-#    POST /batch   {"site":"...","cards":[...],"proxies":[...]}
-#    GET  /status | /stats | /
-#
-#  OPTIONAL PARAMS
-#    variant=<id>   key=<user>   retries=<n>   rotate=0
-#    first,last,email,phone,address1,city,state,zip,country
-#
-#  WHY THIS BUILD
-#    - aiohttp.web => koi thread-per-request cap nahi (Flask+waitress hata diya)
-#    - proxy registry => proxies.txt ki zarurat nahi, bot ke bheje proxy learn karta hai
-#    - har net/429/PCI error pe proxy rotate + cooldown
-#    - global 429 brake + per-host pacer => rate limit storm khatam
-# ==============================================================================
-
 import os
 import re
 import sys
