@@ -1,7 +1,9 @@
+cat << 'EOF' > requirements.txt
 Flask==3.0.3
 aiohttp==3.10.11
 aiohttp-socks==0.8.4
-waitress==3.0.2
-aiodns==4.0.4
+waitress==3.0.0
+aiodns==3.2.0
 brotli==1.1.0
-uvloop==0.23.0
+uvloop==0.20.0
+EOF
